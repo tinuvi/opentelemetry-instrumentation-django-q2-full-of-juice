@@ -44,6 +44,27 @@ Because the consumer span is the current OTel context **during** task execution,
 
 The carrier travels inside the pickled, signed payload (not in broker headers), so it's confidentiality-bound to producers/workers that share `Q_CLUSTER`'s `SECRET_KEY`. Fine for django-q2↔django-q2 propagation; not suitable for non-django-q2 observers reading the broker directly.
 
+## Span attributes
+
+Every emitted span carries OpenTelemetry messaging semantic-convention attributes:
+
+| Attribute | Value |
+|---|---|
+| `messaging.system` | `"django_q2"` |
+| `messaging.operation` | `"publish"` (producer) / `"process"` (consumer) |
+| `messaging.destination.name` | `task["cluster"]` or `"default"` |
+| `messaging.message.id` | `task["id"]` |
+| `django_q2.task.name` | `task["name"]` |
+| `django_q2.func` | dotted path or `repr` of the callable |
+| `django_q2.group` | `task["group"]` (when set) |
+
+Consumer spans inherit `Status(ERROR)` with the underlying error message when `task["success"]` is `False`.
+
+## Caveats
+
+- The producer span uses the "Option A" pattern: it starts, injects the carrier, then ends inside `pre_enqueue`. django-q2 has no `post_enqueue` signal, so the span has near-zero duration and does **not** measure broker publish latency. Upstream `post_enqueue` would let us swap to a wrapping span without changing the public API.
+- django-q2 forks workers; OpenTelemetry SDK background threads (e.g. `BatchSpanProcessor`) do not survive `os.fork`. Either bootstrap with the `opentelemetry-instrument` CLI (each worker initializes its own SDK on import) or configure your tracer provider from a `post_spawn` handler.
+
 ## Status
 
-Early scaffolding. The signal wiring described above is the design target — see `opentelemetry_instrumentation_django_q2/instrumentor.py` for the current state.
+Working v0. See `CHANGELOG.md` for what landed.

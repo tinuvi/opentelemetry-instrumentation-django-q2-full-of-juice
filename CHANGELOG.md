@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Initial project scaffolding for `opentelemetry-instrumentation-django-q2-full-of-juice`.
-- `DjangoQ2Instrumentor` skeleton (signal wiring pending) following the OpenTelemetry `BaseInstrumentor` contract.
+- `DjangoQ2Instrumentor` wired against django-q2's `pre_enqueue`, `pre_execute`, `post_execute_in_worker`, and `post_spawn` signals.
+- Producer span (`async_task/<func>`, `SpanKind.PRODUCER`) emitted from `pre_enqueue`; the trace context is injected into `task["otel_carrier"]` so it survives pickling and ships through the broker.
+- Consumer span (`run/<func>`, `SpanKind.CONSUMER`) started from `pre_execute` as a child of the extracted carrier context and activated as the current OTel context for the duration of the task — nested `async_task(...)` calls inside a task automatically parent under it, enabling end-to-end cascading.
+- Consumer span status: `ERROR` with the underlying message when `task["success"]` is `False`; defensive about the sync-error branch in `django_q/worker.py` that emits `post_execute_in_worker` before `task["success"]`/`result` are set.
+- Messaging semantic-convention attributes on every span: `messaging.system="django_q2"`, `messaging.operation`, `messaging.destination.name` (cluster name or `"default"`), `messaging.message.id`, plus `django_q2.task.name`, `django_q2.func`, and `django_q2.group`.
+- `_uninstrument()` disconnects every signal handler and clears the per-task context store.
 - Per-task context storage helpers in `opentelemetry_instrumentation_django_q2.utils`.
 - Test scaffolding (`tests/testapp/`) with a minimal Django settings module wired to `django-q2` in `sync=True` mode.
