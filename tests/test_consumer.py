@@ -74,7 +74,11 @@ class PreExecuteConsumerStartTests(TestBase):
         self.assertEqual(span.attributes["messaging.system"], "django_q2")
         self.assertEqual(span.attributes["messaging.destination.name"], "test-cluster")
         self.assertEqual(span.attributes["messaging.operation.type"], "process")
-        self.assertEqual(span.attributes["messaging.operation"], "process")
+        # The legacy `messaging.operation` key was deprecated by upstream semconv
+        # in favour of `messaging.operation.type`. We don't emit it, and we guard
+        # against a regression that quietly reintroduces it (it would show up as
+        # duplicate data on dashboards that key on operation type).
+        self.assertNotIn("messaging.operation", span.attributes)
         self.assertEqual(span.attributes["django_q2.task.name"], "demo")
         self.assertEqual(span.attributes["django_q2.group"], "reports")
         self.assertEqual(span.attributes["messaging.message.conversation_id"], "reports")

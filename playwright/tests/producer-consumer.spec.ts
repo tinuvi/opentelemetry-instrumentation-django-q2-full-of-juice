@@ -40,16 +40,17 @@ test.describe('producer/consumer single task', () => {
     expect(serviceOf(trace, producer)).toBe('sample-web');
     expect(serviceOf(trace, consumer)).toBe('sample-worker');
 
-    // Messaging semantic-convention attributes survive end-to-end. We assert both
-    // the new operation.type key and the legacy operation key to guard the
-    // backward-compat shim — collectors on either schema version see the same value.
+    // Messaging semantic-convention attributes survive end-to-end. The legacy
+    // `messaging.operation` key was deprecated by upstream semconv in favour of
+    // `messaging.operation.type`; we don't emit it and guard against a
+    // regression that quietly reintroduces it on either side.
     expect(tag(producer, 'messaging.system')).toBe('django_q2');
     expect(tag(producer, 'messaging.operation.type')).toBe('publish');
-    expect(tag(producer, 'messaging.operation')).toBe('publish');
+    expect(tag(producer, 'messaging.operation')).toBeUndefined();
     expect(tag(producer, 'messaging.message.id')).toBe(enqueue.task_id);
     expect(tag(consumer, 'messaging.system')).toBe('django_q2');
     expect(tag(consumer, 'messaging.operation.type')).toBe('process');
-    expect(tag(consumer, 'messaging.operation')).toBe('process');
+    expect(tag(consumer, 'messaging.operation')).toBeUndefined();
     expect(tag(consumer, 'messaging.message.id')).toBe(enqueue.task_id);
 
     // Exactly one producer and one consumer in this trace.

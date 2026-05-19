@@ -19,7 +19,6 @@ from opentelemetry.semconv._incubating.attributes.messaging_attributes import (
     MESSAGING_DESTINATION_NAME,
     MESSAGING_MESSAGE_CONVERSATION_ID,
     MESSAGING_MESSAGE_ID,
-    MESSAGING_OPERATION,
     MESSAGING_OPERATION_TYPE,
     MESSAGING_SYSTEM,
     MessagingOperationTypeValues,
@@ -50,7 +49,7 @@ _MESSAGING_SYSTEM_NAME = "django_q2"
 _DEFAULT_DESTINATION = "default"
 _PRODUCER_OP = MessagingOperationTypeValues.PUBLISH.value
 _CONSUMER_OP = MessagingOperationTypeValues.PROCESS.value
-_SCHEMA_URL = "https://opentelemetry.io/schemas/1.28.0"
+_SCHEMA_URL = "https://opentelemetry.io/schemas/1.34.0"
 _TASK_DURATION_METRIC = "django_q2.task.duration"
 _PUBLISH_DURATION_METRIC = "django_q2.publish.duration"
 _STATE_SUCCESS = "success"
@@ -275,8 +274,6 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
             return
         span.set_attribute(MESSAGING_SYSTEM, _MESSAGING_SYSTEM_NAME)
         span.set_attribute(MESSAGING_OPERATION_TYPE, op_type)
-        # Deprecated key kept for older collectors that still look at messaging.operation.
-        span.set_attribute(MESSAGING_OPERATION, op_type)
         span.set_attribute(MESSAGING_DESTINATION_NAME, destination or _DEFAULT_DESTINATION)
         span.set_attribute("django_q2.func", func_repr)
         if self._broker_type:

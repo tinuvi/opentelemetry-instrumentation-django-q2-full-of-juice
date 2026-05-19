@@ -1,13 +1,39 @@
+from importlib.metadata import version as _pkg_version
 from unittest import mock
 
+import django_q.tasks
 from django.test import TestCase
 from django_q.conf import Conf
+from opentelemetry import trace
+from opentelemetry.test.test_base import TestBase
 
-from opentelemetry_instrumentation_django_q2 import DjangoQ2Instrumentor
+from opentelemetry_instrumentation_django_q2 import DjangoQ2Instrumentor, __version__
 from opentelemetry_instrumentation_django_q2.instrumentor import (
+    _SCHEMA_URL,
     _read_configured_timeout,
     _resolve_broker_type,
 )
+
+
+class VersionTests(TestCase):
+    """
+    Guard the version.py → importlib.metadata wiring.
+
+    Background: pyproject.toml's `version` is rewritten by `poetry version $TAG_NAME`
+    at publish time, so the only source of truth at runtime is the installed dist
+    metadata. If anything regresses (a placeholder string, a try/except fallback,
+    a missing editable install), the tracer/meter would silently stamp the wrong
+    value on every emitted span/metric.
+    """
+
+    def test_version_matches_installed_package_metadata(self):
+        # Both sides read from the same dist-info entry — this asserts that
+        # version.py is using importlib.metadata and not a hard-coded literal.
+        self.assertEqual(__version__, _pkg_version("opentelemetry-instrumentation-django-q2-full-of-juice"))
+
+    def test_version_is_nonempty_string(self):
+        self.assertIsInstance(__version__, str)
+        self.assertTrue(__version__)
 
 
 class DjangoQ2InstrumentorTests(TestCase):
@@ -90,6 +116,33 @@ class ResolveBrokerTypeTests(TestCase):
             mock.patch.object(Conf, "MONGO", None),
         ):
             self.assertEqual(_resolve_broker_type(), "redis")
+
+
+class SchemaURLTests(TestBase, TestCase):
+    """
+    Guard the schema URL stamped on the tracer/meter scope.
+
+    Backends like the OTel collector use `instrumentation_scope.schema_url` to
+    translate attributes between schema versions. Bumping the constant without
+    a regression test would let a typo (e.g. `1.34` vs `1.34.0`) ship silently.
+    """
+
+    def test_emitted_spans_carry_the_declared_schema_url(self):
+        instrumentor = DjangoQ2Instrumentor()
+        instrumentor.instrument(tracer_provider=self.tracer_provider)
+        try:
+            django_q.tasks.async_task("tests.fixtures.noop", sync=True)
+        finally:
+            instrumentor.uninstrument()
+
+        spans = self.memory_exporter.get_finished_spans()
+        producer = next(s for s in spans if s.kind == trace.SpanKind.PRODUCER)
+        consumer = next(s for s in spans if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(producer.instrumentation_scope.schema_url, _SCHEMA_URL)
+        self.assertEqual(consumer.instrumentation_scope.schema_url, _SCHEMA_URL)
+        # The constant itself must be a real opentelemetry.io schema URL; this
+        # catches a bare-version typo (`1.34.0` instead of the full URL).
+        self.assertTrue(_SCHEMA_URL.startswith("https://opentelemetry.io/schemas/"))
 
 
 class ReadConfiguredTimeoutTests(TestCase):

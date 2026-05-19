@@ -54,7 +54,10 @@ class ProducerSpanLifecycleTests(TestBase, TestCase):
         producer = self._producer_span()
         self.assertEqual(producer.attributes["messaging.system"], "django_q2")
         self.assertEqual(producer.attributes["messaging.operation.type"], "publish")
-        self.assertEqual(producer.attributes["messaging.operation"], "publish")
+        # The legacy `messaging.operation` key was deprecated by upstream semconv
+        # in favour of `messaging.operation.type`. Guard the producer side against
+        # a regression that would re-emit it.
+        self.assertNotIn("messaging.operation", producer.attributes)
         self.assertEqual(producer.attributes["messaging.destination.name"], "custom-q")
         self.assertEqual(producer.attributes["django_q2.func"], "tests.fixtures.add")
         self.assertEqual(producer.attributes["django_q2.group"], "reports")

@@ -52,7 +52,6 @@ Every emitted span carries OpenTelemetry messaging semantic-convention attribute
 |---|---|---|
 | `messaging.system` | `"django_q2"` | |
 | `messaging.operation.type` | `"publish"` (producer) / `"process"` (consumer) | |
-| `messaging.operation` | same as `operation.type` | kept for collectors on the deprecated key |
 | `messaging.destination.name` | `task["cluster"]` or `"default"` | |
 | `messaging.message.id` | `task["id"]` | |
 | `messaging.message.conversation_id` | `task["group"]` | when set; mirrors Celery's `correlation_id` |
