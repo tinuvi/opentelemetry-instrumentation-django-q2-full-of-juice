@@ -112,6 +112,49 @@ def enqueue_iter(request: HttpRequest) -> JsonResponse:
 
 @csrf_exempt
 @require_http_methods(["POST"])
+def enqueue_detached(request: HttpRequest) -> JsonResponse:
+    """
+    Enqueue a task with no ambient OTel context so the PRODUCER span becomes the trace root.
+
+    Models the production cases where `async_task(...)` is called outside any
+    ambient span — django-q2 schedulers, management commands, cron-triggered
+    backfills, or one worker enqueuing follow-up work after its own task has
+    ended. The endpoint detaches the request's context, calls async_task, then
+    restores it: the producer wrap opens its span with no parent, making it a
+    valid trace root.
+
+    Returns `task_id` only. The trace_id is unknown to this endpoint by design
+    (we deliberately don't peek inside the wrap's contextvar) — Playwright
+    looks the trace up by `messaging.message.id = task_id` via Jaeger's tag
+    search, the same way an operator would correlate from an enqueued task.
+    """
+    try:
+        body = json.loads(request.body or b"{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "invalid_json"}, status=400)
+
+    name = body.get("task")
+    if name not in TASK_REGISTRY:
+        return JsonResponse({"error": "unknown_task", "available": sorted(TASK_REGISTRY)}, status=400)
+
+    args = body.get("args", [])
+    kwargs = body.get("kwargs", {})
+
+    # Detach to a fresh empty context so the producer wrap sees no parent span.
+    # `attach(Context())` does NOT replay any active span — that's the whole
+    # point: we want the producer to be a trace root, exactly as it would be
+    # under a scheduler thread or `manage.py` invocation.
+    token = context_api.attach(context_api.Context())
+    try:
+        task_id = async_task(TASK_REGISTRY[name], *args, **kwargs)
+    finally:
+        context_api.detach(token)
+
+    return JsonResponse({"task_id": task_id, "task": name})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
 def enqueue_with_baggage(request: HttpRequest) -> JsonResponse:
     """
     Set OTel baggage in the request context, then enqueue a task that surfaces it on its consumer span.
