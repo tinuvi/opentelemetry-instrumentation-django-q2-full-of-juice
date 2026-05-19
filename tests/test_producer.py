@@ -65,6 +65,16 @@ class ProducerSpanLifecycleTests(TestBase, TestCase):
         self.assertIn("messaging.message.id", producer.attributes)
         self.assertIn("django_q2.task.name", producer.attributes)
 
+    def test_producer_span_has_broker_type_from_configured_orm_backend(self):
+        # testapp's Q_CLUSTER uses `"orm": "default"`. The instrumentor resolves the
+        # backend once at _instrument() time and stamps `django_q2.broker.type` on
+        # every span via _set_messaging_basics — operators can split observability
+        # by broker without out-of-band metadata.
+        async_task("tests.fixtures.noop", sync=True)
+
+        producer = self._producer_span()
+        self.assertEqual(producer.attributes["django_q2.broker.type"], "orm")
+
     def test_producer_span_resolves_destination_to_configured_cluster_name(self):
         # When the caller doesn't pass `cluster=`, the producer span lands on the
         # configured Q_CLUSTER name (django-q2's pusher does the same server-side
@@ -115,6 +125,45 @@ class ProducerSpanLifecycleTests(TestBase, TestCase):
 
         self.assertIn(OTEL_CARRIER_KEY, captured)
         self.assertIn("traceparent", captured[OTEL_CARRIER_KEY])
+
+    def test_pre_enqueue_stashes_caller_timeout_under_private_key(self):
+        # django-q2's worker pops `task["timeout"]` before firing pre_execute (it
+        # uses the value as the Sentinel's per-task kill budget). We stash a copy
+        # under `_otel_timeout` so the consumer signal handler can still recover
+        # the caller's override. Captures the task at pre_enqueue (after our
+        # handler) to confirm the stash key is set before pickling.
+        captured: dict = {}
+
+        def grabber(sender, task, **_):
+            # The stash is populated by our handler — `_on_pre_enqueue` — before
+            # `_inject_carrier` runs. Other handlers see the stashed key by
+            # connecting AFTER us; signal handlers in Django fire in connection
+            # order, and `pre_enqueue.connect(self._on_pre_enqueue, ...)` ran
+            # in `_instrument`, so this late-connected grabber observes our work.
+            captured.update(task)
+
+        pre_enqueue.connect(grabber, weak=False)
+        try:
+            async_task("tests.fixtures.noop", sync=True, timeout=120)
+        finally:
+            pre_enqueue.disconnect(grabber)
+
+        self.assertEqual(captured.get("_otel_timeout"), 120)
+
+    def test_pre_enqueue_does_not_stash_non_positive_timeout(self):
+        # `timeout=0` is not a real budget; we never write a misleading stash.
+        captured: dict = {}
+
+        def grabber(sender, task, **_):
+            captured.update(task)
+
+        pre_enqueue.connect(grabber, weak=False)
+        try:
+            async_task("tests.fixtures.noop", sync=True, timeout=0)
+        finally:
+            pre_enqueue.disconnect(grabber)
+
+        self.assertNotIn("_otel_timeout", captured)
 
     def test_carrier_traceparent_matches_emitted_producer_span(self):
         captured: dict = {}
@@ -272,6 +321,38 @@ class ProducerExtraAttributeTests(TestBase):
         span = self.memory_exporter.get_finished_spans()[0]
         self.assertNotIn("django_q2.chain_length", span.attributes)
 
+    def test_timeout_attribute_set_when_caller_passes_positive_int(self):
+        # The producer-side stamp only sees what the caller passed (no Conf fallback
+        # — the producer doesn't see worker config). 30 seconds is a realistic budget.
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "timeout": 30})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertEqual(span.attributes["django_q2.timeout"], 30)
+
+    def test_timeout_attribute_skipped_when_value_is_zero(self):
+        # 0 is not a meaningful budget — stamping it would lie about "duration ≥ timeout"
+        # alerting queries (any non-instant task would falsely look over-budget).
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "timeout": 0})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertNotIn("django_q2.timeout", span.attributes)
+
+    def test_timeout_attribute_skipped_when_value_is_negative(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "timeout": -1})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertNotIn("django_q2.timeout", span.attributes)
+
+    def test_timeout_attribute_skipped_when_value_is_none(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "timeout": None})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertNotIn("django_q2.timeout", span.attributes)
+
+    def test_timeout_attribute_skipped_when_value_is_bool(self):
+        # bool is a subclass of int in Python — defensively exclude so a `timeout=True`
+        # doesn't land as `django_q2.timeout=1`. django-q2 doesn't accept booleans
+        # here, so this is paranoia; cheap to guard, hard to recover from later.
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "timeout": True})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertNotIn("django_q2.timeout", span.attributes)
+
     def test_all_optional_attributes_absent_when_task_minimal(self):
         self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}})
         span = self.memory_exporter.get_finished_spans()[0]
@@ -282,5 +363,6 @@ class ProducerExtraAttributeTests(TestBase):
             "django_q2.hook",
             "django_q2.iter_count",
             "django_q2.chain_length",
+            "django_q2.timeout",
         ):
             self.assertNotIn(key, span.attributes)

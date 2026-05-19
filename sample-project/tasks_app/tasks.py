@@ -6,6 +6,7 @@ import logging
 import time
 
 from django_q.tasks import async_task
+from opentelemetry import baggage, trace
 
 _logger = logging.getLogger("tasks_app")
 
@@ -55,6 +56,26 @@ def slow_cascade_three(payload: str, seconds: float) -> str:
     return payload
 
 
+def read_baggage() -> dict:
+    """
+    Surface OTel baggage entries on the current consumer span as `baggage.<key>` attributes.
+
+    The instrumentor's `pre_execute` handler attaches the extracted carrier
+    context before this function runs, so `baggage.get_all()` returns whatever
+    the PRODUCER process set before calling `async_task(...)`. Stamping the
+    entries on the span gives Playwright a Jaeger-visible signal it can assert
+    against — that's the regression contract: a future carrier-handling refactor
+    that silently dropped baggage propagation would make these attributes vanish.
+    """
+    span = trace.get_current_span()
+    items = baggage.get_all()
+    for key, value in items.items():
+        # Cast to str defensively — baggage values are strings per the W3C spec,
+        # but the API surfaces `Any` so a third-party setter could pass anything.
+        span.set_attribute(f"baggage.{key}", str(value))
+    return {"baggage_keys": sorted(items.keys()), "baggage_count": len(items)}
+
+
 TASK_REGISTRY = {
     "noop": "tasks_app.tasks.noop",
     "add": "tasks_app.tasks.add",
@@ -64,4 +85,5 @@ TASK_REGISTRY = {
     "slow_noop": "tasks_app.tasks.slow_noop",
     "slow_cascade_two": "tasks_app.tasks.slow_cascade_two",
     "slow_cascade_three": "tasks_app.tasks.slow_cascade_three",
+    "read_baggage": "tasks_app.tasks.read_baggage",
 }

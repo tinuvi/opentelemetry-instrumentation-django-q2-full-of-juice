@@ -67,6 +67,8 @@ Every emitted span carries OpenTelemetry messaging semantic-convention attribute
 | `django_q2.hook` | dotted-path string | only when `task["hook"]` is a string (callable hooks are skipped — see caveats) |
 | `django_q2.iter_count` | positive int | only when `task["iter_count"] > 0` |
 | `django_q2.chain_length` | int | when `task["chain"]` is a list — `len(chain)` |
+| `django_q2.timeout` | positive int (seconds) | per-task budget the Sentinel will enforce. Producer side: only when caller passed `timeout=`. Consumer side: caller value if present, otherwise `Conf.TIMEOUT` from Q_CLUSTER. Absent when neither source has a positive value — `None`/`0` are never stamped. |
+| `django_q2.broker.type` | `"orm"` / `"redis"` / `"mongo"` / `"sqs"` / `"iron_mq"` / dotted path | resolved once at `instrument()` from `Conf.BROKER_CLASS` → `IRON_MQ` → `SQS` → `ORM` → `MONGO` → `redis` default. Span-side only — see "Metrics" notes for why it's not a histogram label. |
 | `django_q2.state` | `"success"` / `"error"` | consumer span only; absent in the sync-error branch where `task["success"]` is unset — mirror of Celery's `celery.state` |
 
 Consumer spans inherit `Status(ERROR)` with the underlying error message when `task["success"]` is `False`, and gain a standard `exception` event whose `exception.type` / `exception.message` / `exception.stacktrace` attributes are parsed out of the `"{e} : {traceback}"` string django-q2 stashes in `task["result"]`. Backends like Jaeger, Tempo, and Grafana render that event as the span's error details.
@@ -79,6 +81,8 @@ Consumer spans inherit `Status(ERROR)` with the underlying error message when `t
 | `django_q2.publish.duration` | histogram | `s` (seconds) | same as above | Producer — wall-clock time inside the `async_task` call (`broker.enqueue` + signing in async mode; full inline run in sync mode). |
 
 Plumb a meter provider with `DjangoQ2Instrumentor().instrument(meter_provider=...)`, or rely on the global one set by `opentelemetry.metrics.set_meter_provider(...)`. Cardinality is bounded intentionally: task name and task id are deliberately **not** labels — they would explode any non-trivial workload. Operators can split a slow broker (`publish.duration` rising, `task.duration` flat) from slow workers (the inverse) without leaving the same dashboard.
+
+`django_q2.broker.type` is also deliberately **not** a metric label. django-q2 has a single broker per cluster, so most fleets would carry a constant value on every histogram series — pure noise with no analytical payoff. Adding a label later is a backward-compatible change; removing one is breaking. The attribute is still emitted on every PRODUCER and CONSUMER span, so operators running multiple cluster types can split traces by backend via span queries.
 
 ## Caveats
 

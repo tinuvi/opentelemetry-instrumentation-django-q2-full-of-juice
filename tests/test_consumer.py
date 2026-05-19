@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest import mock
+
 from django_q.signals import post_execute_in_worker, pre_execute
 from opentelemetry import trace
 from opentelemetry.test.test_base import TestBase
@@ -142,6 +144,89 @@ class PreExecuteConsumerStartTests(TestBase):
             "django_q2.chain_length",
         ):
             self.assertNotIn(key, consumer.attributes)
+        # `django_q2.timeout` is the exception in this pack: even with a minimal task,
+        # the consumer side falls back to Conf.TIMEOUT — the testapp settings declare
+        # `"timeout": 60`, so the attribute IS present despite no task["timeout"].
+        self.assertEqual(consumer.attributes["django_q2.timeout"], 60)
+
+    def test_pre_execute_sets_broker_type_from_configured_orm_backend(self):
+        # testapp settings: `"orm": "default"` ⇒ broker.type resolves to "orm" at
+        # _instrument() time and is stamped on the consumer span (and on the producer,
+        # tested separately). Mirrors django-q2's get_broker precedence.
+        task = self._build_task()
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.attributes["django_q2.broker.type"], "orm")
+
+    def test_pre_execute_prefers_task_timeout_over_conf_fallback(self):
+        # When the caller passed `timeout=N` on the task, that's the budget the
+        # Sentinel will enforce for THIS task — even if Conf.TIMEOUT differs.
+        # (Tests can still pass `timeout=` directly because they simulate
+        # pre_execute manually; the real worker would have popped task["timeout"]
+        # by this point — see the `_otel_timeout` stash test for that scenario.)
+        task = self._build_task(timeout=120)
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.attributes["django_q2.timeout"], 120)
+
+    def test_pre_execute_recovers_caller_timeout_from_stash_after_worker_popped_it(self):
+        # In production django-q2's worker.py pops `task["timeout"]` before
+        # firing pre_execute (uses it to set the Sentinel kill alarm). This test
+        # mirrors that reality: the live key is gone, but the producer-side
+        # `_otel_timeout` stash carries the caller's value through, and we read
+        # it instead of falling back to Conf.TIMEOUT (which would be wrong here
+        # — Conf.TIMEOUT is the cluster default, NOT the per-task override).
+        task = self._build_task(_otel_timeout=120)
+        # `task["timeout"]` is intentionally absent — that's what the worker leaves.
+        self.assertNotIn("timeout", task)
+
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.attributes["django_q2.timeout"], 120)
+
+    def test_pre_execute_uses_conf_timeout_when_task_lacks_one(self):
+        # No task["timeout"] ⇒ stamp the worker's configured budget (testapp = 60).
+        task = self._build_task()
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.attributes["django_q2.timeout"], 60)
+
+    def test_pre_execute_skips_timeout_when_neither_task_nor_conf_has_one(self):
+        # Production case where the user never sets `Q_CLUSTER["timeout"]`: django-q2
+        # leaves Conf.TIMEOUT as None. The attribute must be absent — stamping `null`
+        # or `0` would mislead "duration ≥ timeout" alerting queries.
+        task = self._build_task()
+        with mock.patch(
+            "opentelemetry_instrumentation_django_q2.instrumentor._read_configured_timeout",
+            return_value=None,
+        ):
+            pre_execute.send(sender="django_q", func=lambda: None, task=task)
+            post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertNotIn("django_q2.timeout", consumer.attributes)
+
+    def test_pre_execute_skips_timeout_when_task_value_is_zero_and_no_fallback(self):
+        # `timeout=0` on the task is not a real budget. If Conf has no positive
+        # timeout either, the attribute is absent (we don't pick up the 0).
+        task = self._build_task(timeout=0)
+        with mock.patch(
+            "opentelemetry_instrumentation_django_q2.instrumentor._read_configured_timeout",
+            return_value=None,
+        ):
+            pre_execute.send(sender="django_q", func=lambda: None, task=task)
+            post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertNotIn("django_q2.timeout", consumer.attributes)
 
     def test_pre_execute_consumer_span_is_current_during_execution(self):
         from opentelemetry import context as context_api

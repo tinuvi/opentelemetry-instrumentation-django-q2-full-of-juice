@@ -198,6 +198,15 @@ export async function enqueueIter(
   return (await res.json()) as { task_id: string; trace_id: string; iter_count: number };
 }
 
+export async function enqueueWithBaggage(
+  request: APIRequestContext,
+  body: { trigger_span: string; baggage: Record<string, string> },
+): Promise<{ task_id: string; trace_id: string; baggage_keys: string[] }> {
+  const res = await request.post('/api/enqueue-with-baggage/', { data: body });
+  expect(res.ok(), `enqueue-with-baggage failed: ${res.status()} ${await res.text()}`).toBeTruthy();
+  return (await res.json()) as { task_id: string; trace_id: string; baggage_keys: string[] };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }

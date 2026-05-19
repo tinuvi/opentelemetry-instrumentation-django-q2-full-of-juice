@@ -9,7 +9,8 @@ from django.http import HttpRequest, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django_q.tasks import async_chain, async_iter, async_task
-from opentelemetry import trace
+from opentelemetry import baggage, trace
+from opentelemetry import context as context_api
 
 from tasks_app.tasks import TASK_REGISTRY
 
@@ -107,3 +108,46 @@ def enqueue_iter(request: HttpRequest) -> JsonResponse:
         trace_id_hex = format(span.get_span_context().trace_id, "032x")
 
     return JsonResponse({"task_id": task_id, "trace_id": trace_id_hex, "iter_count": len(arg_tuples)})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def enqueue_with_baggage(request: HttpRequest) -> JsonResponse:
+    """
+    Set OTel baggage in the request context, then enqueue a task that surfaces it on its consumer span.
+
+    Pins the contract that baggage set at the HTTP edge survives the
+    producer → carrier → worker round-trip. Future carrier-handling refactors
+    that silently swap the propagator to TraceContext-only would break this.
+    """
+    try:
+        body = json.loads(request.body or b"{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "invalid_json"}, status=400)
+
+    baggage_items = body.get("baggage", {})
+    if not isinstance(baggage_items, dict) or not baggage_items:
+        return JsonResponse({"error": "baggage_must_be_non_empty_dict"}, status=400)
+
+    # Layer each baggage value into the current context. `set_baggage` returns a
+    # NEW context (it's immutable); attach the last one so subsequent code sees
+    # all entries. Detach in `finally` to keep the request-handler context clean.
+    new_context = context_api.get_current()
+    for key, value in baggage_items.items():
+        new_context = baggage.set_baggage(key, str(value), context=new_context)
+    token = context_api.attach(new_context)
+    try:
+        span_name = body.get("trigger_span", "HTTP POST /api/enqueue-with-baggage/")
+        with _tracer.start_as_current_span(span_name) as span:
+            task_id = async_task("tasks_app.tasks.read_baggage")
+            trace_id_hex = format(span.get_span_context().trace_id, "032x")
+    finally:
+        context_api.detach(token)
+
+    return JsonResponse(
+        {
+            "task_id": task_id,
+            "trace_id": trace_id_hex,
+            "baggage_keys": sorted(baggage_items.keys()),
+        }
+    )

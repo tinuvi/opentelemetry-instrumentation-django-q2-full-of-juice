@@ -56,6 +56,7 @@ playwright/
 │   ├── state.spec.ts               # django_q2.state on consumer (success / error / cascade)
 │   ├── chain.spec.ts               # async_chain → decreasing django_q2.chain_length per layer
 │   ├── iter.spec.ts                # async_iter → django_q2.iter_count on the umbrella task
+│   ├── baggage.spec.ts             # OTel baggage at HTTP edge survives the carrier round-trip
 │   └── metrics.spec.ts             # django_q2.task.duration + django_q2.publish.duration histograms
 ├── playwright.config.ts            # baseURL = $SAMPLE_PROJECT_URL or localhost:8000
 ├── tsconfig.json
@@ -69,6 +70,7 @@ playwright/
 | `POST /api/enqueue/` | `async_task(...)` — most tests use this. Body: `{ task, trigger_span, args?, kwargs? }`. |
 | `POST /api/enqueue-chain/` | `async_chain([(func, args, kwargs), ...])` — exercises `django_q2.chain_length`. |
 | `POST /api/enqueue-iter/` | `async_iter(func, [(args,), ...])` — exercises `django_q2.iter_count`. |
+| `POST /api/enqueue-with-baggage/` | Sets OTel baggage, then enqueues `read_baggage` — exercises carrier baggage propagation. |
 | `GET /health/` | Compose readiness probe. |
 
 `fullyParallel: false` + `workers: 1` keeps the harness honest — the sample has a

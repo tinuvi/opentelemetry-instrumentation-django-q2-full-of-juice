@@ -55,6 +55,13 @@ _TASK_DURATION_METRIC = "django_q2.task.duration"
 _PUBLISH_DURATION_METRIC = "django_q2.publish.duration"
 _STATE_SUCCESS = "success"
 _STATE_ERROR = "error"
+# Private task-dict key. django-q2's worker pops `task["timeout"]` before
+# firing `pre_execute` (it consumes it as the Sentinel's per-task kill budget,
+# see `django_q/worker.py`), so the consumer signal handler can't read the
+# caller's per-task override directly. We stash a copy under this key at
+# pre_enqueue time — it survives the pickle/unpickle round-trip through the
+# broker and lets the consumer span report the same value the producer span did.
+_TIMEOUT_STASH_KEY = "_otel_timeout"
 
 # Set by _wrap_async_task while it runs, read by _on_pre_enqueue. Lets the signal
 # handler tell "wrap is live, enrich its span" from "wrap was bypassed (caller
@@ -89,6 +96,17 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         # span as `django_q2.worker` / `messaging.client.id`. Producers don't
         # know which worker will pick a task up, so they don't get this.
         self._worker_name: str | None = None
+        # Resolved once from django-q2's broker-selection precedence (Conf.BROKER_CLASS
+        # → IRON_MQ → SQS → ORM → MONGO → redis default) at `_instrument()` time.
+        # Stamped on every PRODUCER and CONSUMER span as `django_q2.broker.type` so
+        # operators can split observability by backend without out-of-band metadata
+        # (e.g. distinguishing orm-broker latency from redis-broker latency in a
+        # multi-cluster fleet, or proving an orm→redis migration is taking effect).
+        # Kept off the metric labels deliberately: single-broker fleets — the
+        # common case — would carry a constant column on every histogram series
+        # forever, and removing a label later is a breaking change for downstream
+        # dashboards. Adding the dimension to spans is non-breaking.
+        self._broker_type: str | None = None
 
     def instrumentation_dependencies(self) -> Collection[str]:
         return _instruments
@@ -138,6 +156,10 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         # with ~0 duration since django-q2 has no post_enqueue signal.
         wrap_function_wrapper("django_q.tasks", "async_task", self._wrap_async_task)
 
+        # Resolve the broker backend once. django-q2 has a single broker per
+        # cluster, so this never changes after Q_CLUSTER is loaded.
+        self._broker_type = _resolve_broker_type()
+
         pre_enqueue.connect(self._on_pre_enqueue, weak=False)
         pre_execute.connect(self._on_pre_execute, weak=False)
         post_execute_in_worker.connect(self._on_post_execute_in_worker, weak=False)
@@ -161,6 +183,7 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         clear_task_context()
         self._task_start_times.clear()
         self._worker_name = None
+        self._broker_type = None
         _logger.debug("DjangoQ2Instrumentor uninstrumented")
 
     def _wrap_async_task(self, wrapped, instance, args, kwargs):
@@ -225,6 +248,7 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
             if resolved_cluster:
                 active.set_attribute(MESSAGING_DESTINATION_NAME, resolved_cluster)
                 _RESOLVED_DESTINATION.set(resolved_cluster)
+            _stash_timeout(task)
             self._inject_carrier(task)
             return
 
@@ -239,6 +263,7 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         try:
             self._set_messaging_basics(span, _PRODUCER_OP, task.get("cluster"), func_repr)
             self._apply_task_attributes(span, task)
+            _stash_timeout(task)
             with trace.use_span(span, end_on_exit=False):
                 self._inject_carrier(task)
         finally:
@@ -254,6 +279,8 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         span.set_attribute(MESSAGING_OPERATION, op_type)
         span.set_attribute(MESSAGING_DESTINATION_NAME, destination or _DEFAULT_DESTINATION)
         span.set_attribute("django_q2.func", func_repr)
+        if self._broker_type:
+            span.set_attribute("django_q2.broker.type", self._broker_type)
 
     def _apply_task_attributes(self, span, task: dict) -> None:
         """
@@ -295,6 +322,21 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         chain = task.get("chain")
         if isinstance(chain, list):
             span.set_attribute("django_q2.chain_length", len(chain))
+        # django-q2's `timeout` accepts an integer number of seconds. We stamp
+        # only positive ints so the attribute always represents a real budget
+        # and not a `null`/`0` sentinel — dashboards can express "duration / timeout"
+        # ratios and "timeout-vs-error" filters without a NULL-handling clause.
+        #
+        # Prefer the live `task["timeout"]` if present; fall back to the private
+        # `_otel_timeout` stash. The consumer side will only ever see the stash
+        # because django-q2's worker pops `task["timeout"]` before pre_execute
+        # fires (see _TIMEOUT_STASH_KEY's docstring). On the producer side, the
+        # stash hasn't been set yet so we'll be reading the live key.
+        timeout_value = task.get("timeout")
+        if not _is_positive_int(timeout_value):
+            timeout_value = task.get(_TIMEOUT_STASH_KEY)
+        if _is_positive_int(timeout_value):
+            span.set_attribute("django_q2.timeout", timeout_value)
 
     def _inject_carrier(self, task: dict) -> None:
         try:
@@ -333,6 +375,20 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         consumer_destination = task.get("cluster") or _read_configured_cluster_name()
         self._set_messaging_basics(span, _CONSUMER_OP, consumer_destination, func_repr)
         self._apply_task_attributes(span, task)
+        # Conf.TIMEOUT fallback. The producer can't see worker config, so its
+        # span only ever carries a timeout when the caller passed `timeout=`.
+        # On the consumer we additionally fall back to Conf.TIMEOUT — that's
+        # the budget the Sentinel actually enforces when neither the caller's
+        # override (via the `_otel_timeout` stash) nor a live `task["timeout"]`
+        # is present. Stamp only if positive: the default Conf.TIMEOUT is `None`
+        # (no enforcement), and `None`/`0` on the span would mislead
+        # "duration ≥ timeout" alerting queries.
+        live_timeout = task.get("timeout") if _is_positive_int(task.get("timeout")) else None
+        stashed_timeout = task.get(_TIMEOUT_STASH_KEY) if _is_positive_int(task.get(_TIMEOUT_STASH_KEY)) else None
+        if live_timeout is None and stashed_timeout is None and span.is_recording():
+            fallback_timeout = _read_configured_timeout()
+            if fallback_timeout is not None:
+                span.set_attribute("django_q2.timeout", fallback_timeout)
         if self._worker_name and span.is_recording():
             # Captured once by `post_spawn` in this worker process. Both keys are
             # set so dashboards keyed on either the django-q2-specific name or
@@ -400,6 +456,26 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         _logger.debug("django-q2 worker process spawned: %s", proc_name)
 
 
+def _is_positive_int(value: Any) -> bool:
+    # bool is a subclass of int in Python — defensively exclude it so a stray
+    # `timeout=True` doesn't land as a 1-second budget.
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _stash_timeout(task: dict) -> None:
+    """
+    Copy a positive `task["timeout"]` into the private `_otel_timeout` slot.
+
+    django-q2's worker pops `task["timeout"]` before firing `pre_execute` (it
+    uses the value as the Sentinel's per-task kill budget), so without this
+    copy the consumer signal handler would never see the caller's override.
+    The stash key survives the pickle/unpickle round-trip through the broker.
+    """
+    timeout_value = task.get("timeout")
+    if _is_positive_int(timeout_value):
+        task[_TIMEOUT_STASH_KEY] = timeout_value
+
+
 def _read_configured_cluster_name() -> str | None:
     """Return Q_CLUSTER's configured name if django-q2 is loadable, else None."""
     try:
@@ -412,6 +488,42 @@ def _read_configured_cluster_name() -> str | None:
         return None
     name = getattr(Conf, "CLUSTER_NAME", None)
     return name if name else None
+
+
+def _read_configured_timeout() -> int | None:
+    """Return Q_CLUSTER's configured timeout (positive int seconds) if available."""
+    try:
+        from django_q.conf import Conf
+    except Exception:
+        return None
+    value = getattr(Conf, "TIMEOUT", None)
+    return value if _is_positive_int(value) else None
+
+
+def _resolve_broker_type() -> str | None:
+    """
+    Mirror django_q.brokers.get_broker's precedence to produce a stable short label.
+
+    Order (per django-q2 master, django_q/brokers/__init__.py): BROKER_CLASS →
+    IRON_MQ → SQS → ORM → MONGO → redis (the default fallback). Returns the
+    dotted path verbatim when a custom BROKER_CLASS is set so users can identify
+    their backend exactly.
+    """
+    try:
+        from django_q.conf import Conf
+    except Exception:
+        return None
+    if getattr(Conf, "BROKER_CLASS", None):
+        return Conf.BROKER_CLASS
+    if getattr(Conf, "IRON_MQ", None):
+        return "iron_mq"
+    if isinstance(getattr(Conf, "SQS", None), dict):
+        return "sqs"
+    if getattr(Conf, "ORM", None):
+        return "orm"
+    if getattr(Conf, "MONGO", None):
+        return "mongo"
+    return "redis"
 
 
 def _record_failure(span, result: Any) -> None:
