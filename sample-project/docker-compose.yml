@@ -1,0 +1,67 @@
+services:
+  jaeger:
+    # all-in-one >= 1.35 ships an OTLP receiver (gRPC :4317, HTTP :4318) and the
+    # Query API + UI on :16686. No collector needed.
+    image: jaegertracing/all-in-one:1.63.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI + Query API (used by Playwright)
+      - "4317:4317"     # OTLP gRPC (used by sample web/worker)
+      - "4318:4318"     # OTLP HTTP (handy for ad-hoc curl)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  web:
+    build:
+      context: ..
+      dockerfile: sample-project/Dockerfile
+    image: django-q2-otel-sample:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - sample-data:/data
+    environment: &otel-env
+      DJANGO_SETTINGS_MODULE: sample.settings
+      # Must be identical across web + worker: django-q2 signs the pickled task
+      # payload with this key, and the worker verifies it before executing.
+      DJANGO_SECRET_KEY: "sample-project-shared-secret-do-not-use-in-prod"
+      SAMPLE_DATA_DIR: /data
+      Q_CLUSTER_NAME: sample-cluster
+      Q_CLUSTER_WORKERS: "2"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+      OTEL_SERVICE_NAME: sample-web
+    command: ["./scripts/start-web.sh"]
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  worker:
+    image: django-q2-otel-sample:latest
+    build:
+      context: ..
+      dockerfile: sample-project/Dockerfile
+    depends_on:
+      web:
+        condition: service_healthy
+    volumes:
+      - sample-data:/data
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: sample-worker
+    command: ["./scripts/start-worker.sh"]
+
+volumes:
+  sample-data:
