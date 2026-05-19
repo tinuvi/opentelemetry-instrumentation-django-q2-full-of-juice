@@ -31,14 +31,14 @@ Call this once before workers fork (e.g. in your project's `AppConfig.ready()`, 
 
 ## How it works
 
-The instrumentor connects to django-q2's signal lifecycle:
+The instrumentor connects to django-q2's signal lifecycle. The PRODUCER span is opened by a `wrapt` wrapper around `django_q.tasks.async_task` (so it brackets the broker call); signals enrich it and bridge to the consumer side.
 
 | Signal | Process | Role |
 |---|---|---|
-| `pre_enqueue(task)` | Producer | Start PRODUCER span, inject trace context into `task["otel_carrier"]`, end span. |
-| `post_spawn(proc_name)` | Worker | Per-worker SDK init hook (background threads don't survive `fork`). |
+| `pre_enqueue(task)` | Producer | Enrich the active PRODUCER span (opened by the `async_task` wrap) with task-dict attributes, then inject trace context into `task["otel_carrier"]`. Falls back to opening a near-zero-duration span if the wrap was bypassed — see Caveats. |
+| `post_spawn(proc_name)` | Worker | Capture the worker `proc_name` so later consumer spans can stamp `django_q2.worker` / `messaging.client.id`. |
 | `pre_execute(func, task)` | Worker | Extract carrier, start CONSUMER span as child of the extracted context, attach as the current OTel context. |
-| `post_execute_in_worker(func, task)` | Worker | Set span status from `task["success"]`, end CONSUMER span, detach context. |
+| `post_execute_in_worker(func, task)` | Worker | Set span status from `task["success"]`, end CONSUMER span, detach context, record the `django_q2.task.duration` histogram. |
 
 Because the consumer span is the current OTel context **during** task execution, any nested `async_task(...)` call inside a task automatically parents under it — that's how the cascading chain composes.
 
@@ -90,7 +90,3 @@ Plumb a meter provider with `DjangoQ2Instrumentor().instrument(meter_provider=..
 - `task["hook"]` is only stamped as `django_q2.hook` when it's a dotted-path string. django-q2 also accepts a callable hook, but `repr`-ing a function pointer leaks a memory address that's useless for grouping or filtering, so the callable case is intentionally skipped.
 - The `django_q2.worker` / `messaging.client.id` attribute is captured from the first `post_spawn` signal in each worker process. django-q2 fires that signal at the top of the worker loop (both for forked workers and `sync=True`), so the attribute is present on every consumer span in normal use. It is absent only if `pre_execute` is fired manually (e.g. by tests) before any `post_spawn` ran.
 - **`async_chain` continuity:** django-q2 progresses a chain by having its `monitor` process call `async_chain(task["chain"], ...)` after each link completes. The `monitor` process has no ambient OTel context, so only the *first* chain link sits under the trace that started it; subsequent links land in fresh traces. `django_q2.chain_length` and `django_q2.group` are still stamped on every span, so dashboards can pivot the rest of the pipeline by group. Adding full cross-link propagation would require django-q2 to expose a chain-progression hook upstream — tracked as a follow-up.
-
-## Status
-
-Working v0. See `CHANGELOG.md` for what landed.
