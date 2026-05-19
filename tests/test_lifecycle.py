@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 
+import django_q.tasks
+from django.test import TestCase
 from django_q.signals import (
     post_execute_in_worker,
     post_spawn,
     pre_enqueue,
     pre_execute,
 )
+from opentelemetry import trace
 from opentelemetry.test.test_base import TestBase
 
 from opentelemetry_instrumentation_django_q2 import DjangoQ2Instrumentor
@@ -38,7 +41,7 @@ class PostSpawnTests(TestBase):
         self.assertEqual(self.memory_exporter.get_finished_spans(), ())
 
 
-class UninstrumentTests(TestBase):
+class UninstrumentTests(TestBase, TestCase):
     def test_uninstrument_disconnects_pre_enqueue(self):
         instrumentor = DjangoQ2Instrumentor()
         instrumentor.instrument(tracer_provider=self.tracer_provider)
@@ -70,14 +73,26 @@ class UninstrumentTests(TestBase):
 
         self.assertIsNone(retrieve_task_context("leaked-id"))
 
+    def test_uninstrument_unwraps_async_task(self):
+        # async_task must be restored to its original implementation so that
+        # subsequent calls don't keep producing spans through a stale wrapper.
+        instrumentor = DjangoQ2Instrumentor()
+        instrumentor.instrument(tracer_provider=self.tracer_provider)
+        instrumentor.uninstrument()
+
+        django_q.tasks.async_task("tests.fixtures.noop", sync=True)
+
+        producer_spans = [s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.PRODUCER]
+        self.assertEqual(producer_spans, [])
+
     def test_reinstrumenting_after_uninstrument_works(self):
         instrumentor = DjangoQ2Instrumentor()
         instrumentor.instrument(tracer_provider=self.tracer_provider)
         instrumentor.uninstrument()
         instrumentor.instrument(tracer_provider=self.tracer_provider)
         try:
-            task = {"id": "x", "name": "n", "func": "f", "args": (), "kwargs": {}}
-            pre_enqueue.send(sender="django_q", task=task)
-            self.assertEqual(len(self.memory_exporter.get_finished_spans()), 1)
+            django_q.tasks.async_task("tests.fixtures.noop", sync=True)
+            producer_spans = [s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.PRODUCER]
+            self.assertEqual(len(producer_spans), 1)
         finally:
             instrumentor.uninstrument()

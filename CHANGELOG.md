@@ -16,3 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `_uninstrument()` disconnects every signal handler and clears the per-task context store.
 - Per-task context storage helpers in `opentelemetry_instrumentation_django_q2.utils`.
 - Test scaffolding (`tests/testapp/`) with a minimal Django settings module wired to `django-q2` in `sync=True` mode.
+- `messaging.operation.type` attribute (semconv-current name) on every span alongside the deprecated `messaging.operation` key, with values from `MessagingOperationTypeValues` (`publish` / `process`).
+- Standard OTel `exception` event on the consumer span for failed tasks: parses the `"{e} : {traceback}"` string into `exception.type`, `exception.message`, and `exception.stacktrace` attributes so Jaeger/Tempo/Grafana surface the traceback natively.
+- Tracer is now created with `schema_url="https://opentelemetry.io/schemas/1.28.0"`.
+- `parse_worker_result()` helper in `opentelemetry_instrumentation_django_q2.utils` for extracting `(message, exception_type, stacktrace)` from a worker failure string.
+
+### Changed
+- The PRODUCER span now brackets the whole `django_q.tasks.async_task` call (via a `wrapt` wrapper) instead of starting and ending inside `pre_enqueue`. Result: the span carries a real broker-publish duration. Pre-instrument imports (`from django_q.tasks import async_task` before `instrument()` runs) fall back to the legacy zero-duration path so trace shape stays correct.
+- `_uninstrument()` also unwraps `async_task` so the original function is restored.

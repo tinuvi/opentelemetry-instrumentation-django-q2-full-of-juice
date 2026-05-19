@@ -41,6 +41,8 @@ class PreExecuteConsumerStartTests(TestBase):
         return task
 
     def test_pre_execute_starts_consumer_span_as_child_of_carrier(self):
+        from opentelemetry import context as context_api
+
         task = self._build_task()
 
         pre_execute.send(sender="django_q", func=lambda: None, task=task)
@@ -54,10 +56,7 @@ class PreExecuteConsumerStartTests(TestBase):
         self.assertIsNotNone(parent)
         self.assertEqual(parent.trace_id, 0x11112222333344445555666677778888)
         self.assertEqual(parent.span_id, 0xAAAABBBBCCCCDDDD)
-        # Cleanup so other tests don't see lingering state.
         activation.__exit__(None, None, None)
-        from opentelemetry import context as context_api
-
         if token is not None:
             context_api.detach(token)
 
@@ -72,12 +71,15 @@ class PreExecuteConsumerStartTests(TestBase):
         self.assertEqual(span.attributes["messaging.message.id"], "task-id-xyz")
         self.assertEqual(span.attributes["messaging.system"], "django_q2")
         self.assertEqual(span.attributes["messaging.destination.name"], "test-cluster")
+        self.assertEqual(span.attributes["messaging.operation.type"], "process")
         self.assertEqual(span.attributes["messaging.operation"], "process")
         self.assertEqual(span.attributes["django_q2.task.name"], "demo")
         self.assertEqual(span.attributes["django_q2.group"], "reports")
         self.assertEqual(span.attributes["django_q2.func"], "tests.fixtures.noop")
 
     def test_pre_execute_consumer_span_is_current_during_execution(self):
+        from opentelemetry import context as context_api
+
         task = self._build_task()
         observed: list[int] = []
 
@@ -85,14 +87,11 @@ class PreExecuteConsumerStartTests(TestBase):
             observed.append(trace.get_current_span().get_span_context().span_id)
 
         pre_execute.send(sender="django_q", func=fake_func, task=task)
-        # Simulate worker calling the function while the consumer span is active.
         fake_func()
         ctx = retrieve_task_context(task["id"])
         span, activation, token = ctx
         self.assertEqual(observed[-1], span.get_span_context().span_id)
         activation.__exit__(None, None, None)
-        from opentelemetry import context as context_api
-
         if token is not None:
             context_api.detach(token)
 
@@ -142,22 +141,33 @@ class PostExecuteInWorkerEndTests(TestBase):
         spans = self.memory_exporter.get_finished_spans()
         consumer = next(s for s in spans if s.kind == trace.SpanKind.CONSUMER)
         self.assertEqual(consumer.status.status_code, StatusCode.UNSET)
+        self.assertEqual(consumer.events, ())
         self.assertIsNone(retrieve_task_context(task["id"]))
 
-    def test_failure_path_sets_error_status_with_message(self):
+    def test_failure_records_exception_event_with_type_message_stacktrace(self):
         task = self._build_task()
 
         pre_execute.send(sender="django_q", func=lambda: None, task=task)
         task["success"] = False
-        task["result"] = "boom : Traceback (most recent call last)..."
+        task["result"] = (
+            "boom! : Traceback (most recent call last):\n"
+            '  File "/app/tests/fixtures.py", line 17, in boom\n'
+            '    raise RuntimeError("boom!")\n'
+            "RuntimeError: boom!"
+        )
         post_execute_in_worker.send(sender="django_q", func=None, task=task)
 
-        spans = self.memory_exporter.get_finished_spans()
-        consumer = next(s for s in spans if s.kind == trace.SpanKind.CONSUMER)
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
         self.assertEqual(consumer.status.status_code, StatusCode.ERROR)
-        self.assertEqual(consumer.status.description, "boom")
+        self.assertEqual(consumer.status.description, "boom!")
+        self.assertEqual(len(consumer.events), 1)
+        event = consumer.events[0]
+        self.assertEqual(event.name, "exception")
+        self.assertEqual(event.attributes["exception.type"], "RuntimeError")
+        self.assertEqual(event.attributes["exception.message"], "boom!")
+        self.assertIn("RuntimeError: boom!", event.attributes["exception.stacktrace"])
 
-    def test_failure_without_traceback_separator_still_records_status(self):
+    def test_failure_without_traceback_separator_records_status_only(self):
         task = self._build_task()
 
         pre_execute.send(sender="django_q", func=lambda: None, task=task)
@@ -168,6 +178,12 @@ class PostExecuteInWorkerEndTests(TestBase):
         consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
         self.assertEqual(consumer.status.status_code, StatusCode.ERROR)
         self.assertEqual(consumer.status.description, "just-an-error-string")
+        # No traceback in the input ⇒ we still emit an event with just the message.
+        self.assertEqual(len(consumer.events), 1)
+        event = consumer.events[0]
+        self.assertEqual(event.attributes["exception.message"], "just-an-error-string")
+        self.assertNotIn("exception.type", event.attributes)
+        self.assertNotIn("exception.stacktrace", event.attributes)
 
     def test_sync_error_branch_missing_success_key_is_tolerated(self):
         # Mirrors worker.py:113 — sync error path may emit post_execute_in_worker
@@ -178,14 +194,13 @@ class PostExecuteInWorkerEndTests(TestBase):
         post_execute_in_worker.send(sender="django_q", func=None, task=task)
 
         consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
-        # No success info ⇒ UNSET (we don't know it failed).
         self.assertEqual(consumer.status.status_code, StatusCode.UNSET)
+        self.assertEqual(consumer.events, ())
 
     def test_post_execute_without_prior_pre_execute_is_noop(self):
         task = self._build_task()
         task["success"] = True
 
-        # No pre_execute fired — handler must bail gracefully without raising.
         post_execute_in_worker.send(sender="django_q", func=None, task=task)
 
         self.assertEqual(self.memory_exporter.get_finished_spans(), ())

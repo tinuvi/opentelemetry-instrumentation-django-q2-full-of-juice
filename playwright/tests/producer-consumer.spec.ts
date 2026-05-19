@@ -40,16 +40,39 @@ test.describe('producer/consumer single task', () => {
     expect(serviceOf(trace, producer)).toBe('sample-web');
     expect(serviceOf(trace, consumer)).toBe('sample-worker');
 
-    // Messaging semantic-convention attributes survive end-to-end.
+    // Messaging semantic-convention attributes survive end-to-end. We assert both
+    // the new operation.type key and the legacy operation key to guard the
+    // backward-compat shim — collectors on either schema version see the same value.
     expect(tag(producer, 'messaging.system')).toBe('django_q2');
+    expect(tag(producer, 'messaging.operation.type')).toBe('publish');
     expect(tag(producer, 'messaging.operation')).toBe('publish');
     expect(tag(producer, 'messaging.message.id')).toBe(enqueue.task_id);
     expect(tag(consumer, 'messaging.system')).toBe('django_q2');
+    expect(tag(consumer, 'messaging.operation.type')).toBe('process');
     expect(tag(consumer, 'messaging.operation')).toBe('process');
     expect(tag(consumer, 'messaging.message.id')).toBe(enqueue.task_id);
 
     // Exactly one producer and one consumer in this trace.
     expect(spansByKind(trace, 'producer')).toHaveLength(1);
     expect(spansByKind(trace, 'consumer')).toHaveLength(1);
+  });
+
+  test('PRODUCER span covers broker publish — not the old near-zero duration', async ({ request }) => {
+    // Proves gap #2 fix: the wrap brackets broker.enqueue, so the PRODUCER span
+    // has a real (>0) duration. Old behaviour would have surfaced ~0 µs here.
+    const trigger = unique('e2e-producer-duration');
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+    });
+
+    const trace = await fetchTraceWhenReady(enqueue.trace_id, 3);
+    const producer = spanByOperation(trace, 'async_task/tasks_app.tasks.noop');
+
+    // Jaeger reports duration in microseconds. A single ORM-broker enqueue hits
+    // SQLite + a signing roundtrip — comfortably above 100µs in any real setup.
+    expect(producer.duration).toBeGreaterThan(100);
   });
 });
