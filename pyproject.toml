@@ -1,0 +1,84 @@
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "opentelemetry-instrumentation-django-q2-full-of-juice"
+# Placeholder. The publication workflow runs `poetry version $TAG_NAME` to set the real version from the git tag.
+version = "0.0.0"
+description = "OpenTelemetry instrumentation for django-q2"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = { file = "LICENSE" }
+authors = [
+    {name = "Tinuvi", email = "no-reply@tinuvi.com"}
+]
+
+[tool.poetry]
+packages = [{ include = "opentelemetry_instrumentation_django_q2" }]
+
+[project.urls]
+repository = "https://github.com/tinuvi/opentelemetry-instrumentation-django-q2-full-of-juice"
+"Bug Tracker" = "https://github.com/tinuvi/opentelemetry-instrumentation-django-q2-full-of-juice/issues"
+
+[project.entry-points.opentelemetry_instrumentor]
+django_q2 = "opentelemetry_instrumentation_django_q2:DjangoQ2Instrumentor"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+django = "^5.2.11"
+"django-q2" = "~=1.10"
+opentelemetry-api = "~=1.30"
+opentelemetry-instrumentation = "~=0.51b0"
+opentelemetry-semantic-conventions = "~=0.51b0"
+wrapt = "^1.17"
+
+[tool.poetry.group.dev.dependencies]
+coverage = "~=7.13"
+pyrefly = "~=0.64"
+ruff = "^0.15.2"
+mypy = "^1.20.2"
+django-stubs = "~=6.0"
+unittest-xml-reporting = "~=4.0"
+opentelemetry-sdk = "~=1.30"
+opentelemetry-test-utils = "~=0.51b0"
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+extend-exclude = ["scripts", ".github/workflows"]
+
+[tool.ruff.lint]
+select = [
+    "D", # pydocstyle
+    "E", # pycodestyle errors
+    "EXE", # flake8-executable
+    "F", # pyflakes
+    "I", # isort
+    "S", # flake8-bandit
+    "SIM", # flake8-simplify
+    "UP", # pyupgrade
+    "W", # pycodestyle warnings
+]
+ignore = [
+    "E501", # line too long, formatter will handle this
+    "SIM117", # Use a single `with` statement with multiple contexts instead of nested `with` statements
+    "D1",
+    "D203",
+    "D212",
+]
+
+[tool.pyrefly.errors]
+bad-override-param-name = false
+
+[tool.pyrefly]
+python-version = "3.14"
+project-includes = ["opentelemetry_instrumentation_django_q2"]
+project-excludes = [
+    "**/migrations/**",
+    "**/__pycache__",
+    "**/*venv/**",
+    ".github/workflows/test_pypi_publish.py",
+]
+check-unannotated-defs = false
+infer-return-types = "checked"
+permissive-ignores = true

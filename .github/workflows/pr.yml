@@ -1,0 +1,48 @@
+name: PR checks
+
+on:
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Shallow clones should be disabled for a better relevancy of analysis
+          fetch-depth: 0
+      - name: Run lint and formatter checks
+        run: |
+          docker compose up --build --exit-code-from lint-formatter lint-formatter
+      - name: Run integration tests
+        run: |
+          docker compose up --build --exit-code-from integration-tests integration-tests
+      # Secrets are not passed to runners on PRs from forks, so SONAR_TOKEN would
+      # resolve to an empty string and the scan would fail. Skip the step in that case.
+      # https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions#using-secrets-in-a-workflow
+      - name: SonarQube Scan
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: SonarSource/sonarqube-scan-action@v8.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install Poetry
+        run: pip install poetry==2.4.1
+      - name: Configure Test PyPI
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          poetry config repositories.testpypi https://test.pypi.org/legacy/
+          poetry config pypi-token.testpypi ${{ secrets.TEST_PYPI_TOKEN }}
+      - name: Publish to Test PyPI
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          cd .github/workflows
+          python -c "from test_pypi_publish import publish_test_pypi; publish_test_pypi(path='${{ github.workspace }}')"
