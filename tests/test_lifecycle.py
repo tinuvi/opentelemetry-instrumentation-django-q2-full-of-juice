@@ -40,6 +40,70 @@ class PostSpawnTests(TestBase):
         post_spawn.send(sender="django_q", proc_name="qworker-1")
         self.assertEqual(self.memory_exporter.get_finished_spans(), ())
 
+    def test_post_spawn_captures_proc_name_for_later_consumer_spans(self):
+        from django_q.signals import post_execute_in_worker, pre_execute
+
+        post_spawn.send(sender="django_q", proc_name="qworker-7")
+
+        task = {
+            "id": "task-worker-stamp",
+            "name": "demo",
+            "func": "tests.fixtures.noop",
+            "args": (),
+            "kwargs": {},
+            "cluster": "test-cluster",
+            OTEL_CARRIER_KEY: {},
+        }
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.attributes["django_q2.worker"], "qworker-7")
+        # semconv mirror — lets messaging dashboards filter by worker without
+        # knowing django-q2's bespoke key.
+        self.assertEqual(consumer.attributes["messaging.client.id"], "qworker-7")
+
+    def test_consumer_span_has_no_worker_attribute_before_post_spawn(self):
+        from django_q.signals import post_execute_in_worker, pre_execute
+
+        task = {
+            "id": "task-without-worker",
+            "name": "demo",
+            "func": "tests.fixtures.noop",
+            "args": (),
+            "kwargs": {},
+            "cluster": "test-cluster",
+            OTEL_CARRIER_KEY: {},
+        }
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertNotIn("django_q2.worker", consumer.attributes)
+        self.assertNotIn("messaging.client.id", consumer.attributes)
+
+    def test_post_spawn_does_not_stamp_producer_span(self):
+        # The producer doesn't know which worker will pick the task up, so we
+        # intentionally don't stamp django_q2.worker on producer spans.
+        from django_q.tasks import async_task
+
+        post_spawn.send(sender="django_q", proc_name="qworker-9")
+        async_task("tests.fixtures.noop", sync=True)
+
+        producer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.PRODUCER)
+        self.assertNotIn("django_q2.worker", producer.attributes)
+        self.assertNotIn("messaging.client.id", producer.attributes)
+
+    def test_uninstrument_clears_captured_worker_name(self):
+        post_spawn.send(sender="django_q", proc_name="qworker-leak")
+        self.assertEqual(self.instrumentor._worker_name, "qworker-leak")
+
+        self.instrumentor.uninstrument()
+        # Re-instrument to keep tearDown's uninstrument idempotent.
+        self.instrumentor.instrument(tracer_provider=self.tracer_provider)
+
+        self.assertIsNone(self.instrumentor._worker_name)
+
 
 class UninstrumentTests(TestBase, TestCase):
     def test_uninstrument_disconnects_pre_enqueue(self):
@@ -96,3 +160,39 @@ class UninstrumentTests(TestBase, TestCase):
             self.assertEqual(len(producer_spans), 1)
         finally:
             instrumentor.uninstrument()
+
+
+class DoubleInstrumentTests(TestBase, TestCase):
+    """
+    `BaseInstrumentor.instrument()` is a no-op on a second call.
+
+    If our `_instrument` ran twice, every signal handler would be wired twice
+    (we connect with `weak=False`), and a single task would emit two PRODUCER
+    spans and two CONSUMER spans. Pin the right behavior — mirror of Celery's
+    `tests/test_duplicate.py`.
+    """
+
+    def test_calling_instrument_twice_does_not_double_fire_signals(self):
+        instrumentor = DjangoQ2Instrumentor()
+        instrumentor.instrument(tracer_provider=self.tracer_provider)
+        instrumentor.instrument(tracer_provider=self.tracer_provider)
+        try:
+            django_q.tasks.async_task("tests.fixtures.add", 1, 2, sync=True)
+        finally:
+            instrumentor.uninstrument()
+
+        spans = self.memory_exporter.get_finished_spans()
+        producers = [s for s in spans if s.kind == trace.SpanKind.PRODUCER]
+        consumers = [s for s in spans if s.kind == trace.SpanKind.CONSUMER]
+        self.assertEqual(len(producers), 1, f"expected 1 producer, got {[s.name for s in producers]}")
+        self.assertEqual(len(consumers), 1, f"expected 1 consumer, got {[s.name for s in consumers]}")
+
+    def test_calling_uninstrument_twice_is_safe(self):
+        instrumentor = DjangoQ2Instrumentor()
+        instrumentor.instrument(tracer_provider=self.tracer_provider)
+        instrumentor.uninstrument()
+        instrumentor.uninstrument()
+        django_q.tasks.async_task("tests.fixtures.noop", sync=True)
+
+        producer_spans = [s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.PRODUCER]
+        self.assertEqual(producer_spans, [])

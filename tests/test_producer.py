@@ -58,6 +58,10 @@ class ProducerSpanLifecycleTests(TestBase, TestCase):
         self.assertEqual(producer.attributes["messaging.destination.name"], "custom-q")
         self.assertEqual(producer.attributes["django_q2.func"], "tests.fixtures.add")
         self.assertEqual(producer.attributes["django_q2.group"], "reports")
+        # `messaging.message.conversation_id` (semconv) mirrors `django_q2.group` so
+        # generic messaging dashboards (built for Celery's `correlation_id`) light up
+        # for django-q2 traces too. We keep `django_q2.group` for backward compat.
+        self.assertEqual(producer.attributes["messaging.message.conversation_id"], "reports")
         self.assertIn("messaging.message.id", producer.attributes)
         self.assertIn("django_q2.task.name", producer.attributes)
 
@@ -66,6 +70,13 @@ class ProducerSpanLifecycleTests(TestBase, TestCase):
 
         producer = self._producer_span()
         self.assertEqual(producer.attributes["messaging.destination.name"], "default")
+
+    def test_producer_span_omits_conversation_id_when_no_group(self):
+        async_task("tests.fixtures.noop", sync=True)
+
+        producer = self._producer_span()
+        self.assertNotIn("messaging.message.conversation_id", producer.attributes)
+        self.assertNotIn("django_q2.group", producer.attributes)
 
     def test_producer_span_duration_includes_wrapped_call(self):
         # Patch SignedPackage.dumps to add measurable latency — proves the PRODUCER
@@ -176,3 +187,96 @@ class PreEnqueueHandlerTests(TestBase):
 
         self.assertEqual(task[OTEL_CARRIER_KEY]["x-custom"], "preexisting")
         self.assertIn("traceparent", task[OTEL_CARRIER_KEY])
+
+
+class ProducerExtraAttributeTests(TestBase):
+    """
+    The `django_q2.*` attribute pack.
+
+    Set on the PRODUCER span when the corresponding task-dict field is present,
+    skipped when it isn't.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.instrumentor = DjangoQ2Instrumentor()
+        self.instrumentor.instrument(tracer_provider=self.tracer_provider)
+        self._tracer = self.tracer_provider.get_tracer("test-extra-attrs")
+
+    def tearDown(self):
+        self.instrumentor.uninstrument()
+        super().tearDown()
+
+    def _send_with_active_producer(self, task: dict) -> None:
+        with self._tracer.start_as_current_span("fake-producer", kind=trace.SpanKind.PRODUCER):
+            pre_enqueue.send(sender="django_q", task=task)
+
+    def test_cached_attribute_set_when_truthy(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "cached": True})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertIs(span.attributes["django_q2.cached"], True)
+
+    def test_sync_attribute_set_when_truthy(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "sync": True})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertIs(span.attributes["django_q2.sync"], True)
+
+    def test_ack_failure_attribute_set_when_truthy(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "ack_failure": True})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertIs(span.attributes["django_q2.ack_failure"], True)
+
+    def test_hook_attribute_set_when_string(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "hook": "tasks.callback"})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertEqual(span.attributes["django_q2.hook"], "tasks.callback")
+
+    def test_hook_attribute_skipped_for_callable(self):
+        # A bare function pointer has no stable string form — repr-ing it leaks
+        # a memory address that's useless for grouping. Skip it.
+        def some_hook():
+            pass
+
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "hook": some_hook})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertNotIn("django_q2.hook", span.attributes)
+
+    def test_iter_count_attribute_set_when_positive_int(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "iter_count": 5})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertEqual(span.attributes["django_q2.iter_count"], 5)
+
+    def test_iter_count_skipped_for_zero(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "iter_count": 0})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertNotIn("django_q2.iter_count", span.attributes)
+
+    def test_chain_length_attribute_set_when_chain_list_present(self):
+        self._send_with_active_producer(
+            {"id": "x", "func": "f", "args": (), "kwargs": {}, "chain": ["task_b", "task_c"]},
+        )
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertEqual(span.attributes["django_q2.chain_length"], 2)
+
+    def test_chain_length_zero_when_chain_empty_list(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "chain": []})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertEqual(span.attributes["django_q2.chain_length"], 0)
+
+    def test_chain_attribute_skipped_when_not_a_list(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "chain": None})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertNotIn("django_q2.chain_length", span.attributes)
+
+    def test_all_optional_attributes_absent_when_task_minimal(self):
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}})
+        span = self.memory_exporter.get_finished_spans()[0]
+        for key in (
+            "django_q2.cached",
+            "django_q2.sync",
+            "django_q2.ack_failure",
+            "django_q2.hook",
+            "django_q2.iter_count",
+            "django_q2.chain_length",
+        ):
+            self.assertNotIn(key, span.attributes)

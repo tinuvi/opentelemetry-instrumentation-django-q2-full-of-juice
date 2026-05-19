@@ -75,7 +75,73 @@ class PreExecuteConsumerStartTests(TestBase):
         self.assertEqual(span.attributes["messaging.operation"], "process")
         self.assertEqual(span.attributes["django_q2.task.name"], "demo")
         self.assertEqual(span.attributes["django_q2.group"], "reports")
+        self.assertEqual(span.attributes["messaging.message.conversation_id"], "reports")
         self.assertEqual(span.attributes["django_q2.func"], "tests.fixtures.noop")
+
+    def test_pre_execute_omits_conversation_id_when_no_group(self):
+        task = self._build_task()  # no group override
+
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertNotIn("messaging.message.conversation_id", consumer.attributes)
+        self.assertNotIn("django_q2.group", consumer.attributes)
+
+    def test_pre_execute_sets_extra_attribute_pack(self):
+        def some_callable():
+            pass
+
+        task = self._build_task(
+            cached=True,
+            sync=True,
+            ack_failure=True,
+            hook="tasks.callback",
+            iter_count=3,
+            chain=["task_b", "task_c", "task_d"],
+        )
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertIs(consumer.attributes["django_q2.cached"], True)
+        self.assertIs(consumer.attributes["django_q2.sync"], True)
+        self.assertIs(consumer.attributes["django_q2.ack_failure"], True)
+        self.assertEqual(consumer.attributes["django_q2.hook"], "tasks.callback")
+        self.assertEqual(consumer.attributes["django_q2.iter_count"], 3)
+        self.assertEqual(consumer.attributes["django_q2.chain_length"], 3)
+
+        # And a callable `hook` is intentionally NOT recorded — the repr leaks a
+        # memory address that's useless for filtering.
+        task_callable = self._build_task(id="task-id-callable-hook", hook=some_callable)
+        pre_execute.send(sender="django_q", func=lambda: None, task=task_callable)
+        post_execute_in_worker.send(
+            sender="django_q",
+            func=None,
+            task={**task_callable, "success": True, "result": None},
+        )
+        consumer_b = next(
+            s
+            for s in self.memory_exporter.get_finished_spans()
+            if s.kind == trace.SpanKind.CONSUMER and s.attributes.get("messaging.message.id") == "task-id-callable-hook"
+        )
+        self.assertNotIn("django_q2.hook", consumer_b.attributes)
+
+    def test_pre_execute_omits_extra_attribute_pack_when_absent(self):
+        task = self._build_task()
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        for key in (
+            "django_q2.cached",
+            "django_q2.sync",
+            "django_q2.ack_failure",
+            "django_q2.hook",
+            "django_q2.iter_count",
+            "django_q2.chain_length",
+        ):
+            self.assertNotIn(key, consumer.attributes)
 
     def test_pre_execute_consumer_span_is_current_during_execution(self):
         from opentelemetry import context as context_api

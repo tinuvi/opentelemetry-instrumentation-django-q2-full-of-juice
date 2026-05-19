@@ -1,0 +1,36 @@
+# Sample-only metrics fanout. Traces still ship straight to Jaeger from the
+# web and worker processes (see OTEL_EXPORTER_OTLP_TRACES_ENDPOINT). Metrics
+# land here and are re-exposed in Prometheus format so the Playwright suite can
+# scrape :8889 and assert against `django_q2_task_duration_seconds_*`.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    # Smaller than default — keeps Playwright's scrape-after-trace loop tight.
+    timeout: 1s
+    send_batch_size: 64
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Without this, OTLP attributes like `django_q2.func` become labels named
+    # `django_q2_func` only when sanitization matches — be explicit.
+    resource_to_telemetry_conversion:
+      enabled: false
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]

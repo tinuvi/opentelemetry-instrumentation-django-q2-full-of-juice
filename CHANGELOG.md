@@ -20,7 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Standard OTel `exception` event on the consumer span for failed tasks: parses the `"{e} : {traceback}"` string into `exception.type`, `exception.message`, and `exception.stacktrace` attributes so Jaeger/Tempo/Grafana surface the traceback natively.
 - Tracer is now created with `schema_url="https://opentelemetry.io/schemas/1.28.0"`.
 - `parse_worker_result()` helper in `opentelemetry_instrumentation_django_q2.utils` for extracting `(message, exception_type, stacktrace)` from a worker failure string.
+- `messaging.message.conversation_id` attribute (semconv) on producer and consumer spans, mirroring `django_q2.group` so generic messaging dashboards group related messages without knowing the django-q2-specific key.
+- `django_q2.task.duration` histogram metric (unit: seconds, labels: `messaging.destination.name`, `django_q2.func`, `status="success"|"error"`) recorded once per consumer task. `_instrument(meter_provider=...)` now accepts a meter provider.
+- `django_q2.*` attribute pack on producer and consumer spans, derived from the task dict: `django_q2.cached`, `django_q2.sync`, `django_q2.ack_failure`, `django_q2.hook` (only when it's a string — callables are skipped), `django_q2.iter_count` (positive int), `django_q2.chain_length` (from a list-shaped `chain`).
+- `django_q2.worker` and `messaging.client.id` attributes on consumer spans, captured once per worker process from `post_spawn`'s `proc_name`. Not stamped on producer spans (the producer doesn't know which worker will pick the task up).
+- Regression test for `instrument()` idempotency — a second `instrument()` call must not double-fire signal handlers.
 
 ### Changed
 - The PRODUCER span now brackets the whole `django_q.tasks.async_task` call (via a `wrapt` wrapper) instead of starting and ending inside `pre_enqueue`. Result: the span carries a real broker-publish duration. Pre-instrument imports (`from django_q.tasks import async_task` before `instrument()` runs) fall back to the legacy zero-duration path so trace shape stays correct.
 - `_uninstrument()` also unwraps `async_task` so the original function is restored.
+- Producer and consumer attribute setting consolidated into a shared `_apply_task_attributes` helper so both span sides stay in lockstep.

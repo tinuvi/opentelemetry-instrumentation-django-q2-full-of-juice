@@ -60,6 +60,21 @@ jobs:
           docker compose -f $COMPOSE_FILE logs --tail 200 jaeger
           exit 1
 
+      - name: Wait for OTel collector Prometheus endpoint
+        run: |
+          # metrics.spec.ts scrapes :8889 for the histogram — fail fast here if
+          # the collector never started serving so the failure mode is obvious.
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://localhost:8889/metrics > /dev/null; then
+              echo "otel-collector prometheus endpoint is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "otel-collector failed to come up"
+          docker compose -f $COMPOSE_FILE logs --tail 200 otel-collector
+          exit 1
+
       - name: Install Playwright dependencies
         working-directory: playwright
         run: |
@@ -72,6 +87,7 @@ jobs:
           CI: 'true'
           SAMPLE_PROJECT_URL: http://localhost:8000
           JAEGER_URL: http://localhost:16686
+          COLLECTOR_PROMETHEUS_URL: http://localhost:8889
         run: npm test -- --project=chromium
 
       - name: Dump compose logs on failure
@@ -82,6 +98,7 @@ jobs:
           docker compose -f $COMPOSE_FILE logs --no-color jaeger > /tmp/compose-logs/jaeger.log || true
           docker compose -f $COMPOSE_FILE logs --no-color web > /tmp/compose-logs/web.log || true
           docker compose -f $COMPOSE_FILE logs --no-color worker > /tmp/compose-logs/worker.log || true
+          docker compose -f $COMPOSE_FILE logs --no-color otel-collector > /tmp/compose-logs/otel-collector.log || true
 
       - name: Tear down compose stack
         if: always()

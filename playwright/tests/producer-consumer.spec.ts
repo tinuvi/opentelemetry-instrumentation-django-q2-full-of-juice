@@ -57,6 +57,78 @@ test.describe('producer/consumer single task', () => {
     expect(spansByKind(trace, 'consumer')).toHaveLength(1);
   });
 
+  test('task group flows to messaging.message.conversation_id on both spans', async ({ request }) => {
+    // Group is django-q2's analogue of Celery's correlation_id. We expose it as
+    // both `django_q2.group` (familiar key) and `messaging.message.conversation_id`
+    // (current semconv) so generic messaging dashboards group related messages.
+    const trigger = unique('e2e-group-conversation-id');
+    const groupName = `group-${Date.now()}`;
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+      kwargs: { group: groupName },
+    });
+
+    const trace = await fetchTraceWhenReady(enqueue.trace_id, 3);
+    const producer = spanByOperation(trace, 'async_task/tasks_app.tasks.noop');
+    const consumer = spanByOperation(trace, 'run/tasks_app.tasks.noop');
+
+    expect(tag(producer, 'django_q2.group')).toBe(groupName);
+    expect(tag(producer, 'messaging.message.conversation_id')).toBe(groupName);
+    expect(tag(consumer, 'django_q2.group')).toBe(groupName);
+    expect(tag(consumer, 'messaging.message.conversation_id')).toBe(groupName);
+  });
+
+  test('no group ⇒ no conversation_id / django_q2.group on either span', async ({ request }) => {
+    const trigger = unique('e2e-no-group');
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+    });
+
+    const trace = await fetchTraceWhenReady(enqueue.trace_id, 3);
+    const producer = spanByOperation(trace, 'async_task/tasks_app.tasks.noop');
+    const consumer = spanByOperation(trace, 'run/tasks_app.tasks.noop');
+
+    expect(tag(producer, 'messaging.message.conversation_id')).toBeUndefined();
+    expect(tag(producer, 'django_q2.group')).toBeUndefined();
+    expect(tag(consumer, 'messaging.message.conversation_id')).toBeUndefined();
+    expect(tag(consumer, 'django_q2.group')).toBeUndefined();
+  });
+
+  test('CONSUMER carries worker identifier captured from post_spawn', async ({ request }) => {
+    // post_spawn fires once per forked worker, before any task runs. The
+    // instrumentor stashes proc_name and stamps it on every later CONSUMER span
+    // so dashboards can pin a failing task to the exact worker process.
+    const trigger = unique('e2e-worker-identifier');
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+    });
+
+    const trace = await fetchTraceWhenReady(enqueue.trace_id, 3);
+    const consumer = spanByOperation(trace, 'run/tasks_app.tasks.noop');
+    const producer = spanByOperation(trace, 'async_task/tasks_app.tasks.noop');
+
+    const worker = tag(consumer, 'django_q2.worker');
+    expect(typeof worker).toBe('string');
+    expect(String(worker)).not.toBe('');
+    // semconv mirror: same value under messaging.client.id so generic dashboards
+    // filter by worker without knowing django-q2's bespoke key.
+    expect(tag(consumer, 'messaging.client.id')).toBe(worker);
+
+    // The producer doesn't know which worker will pick the task up — stamping
+    // it there would be a lie. Guard against that regressing.
+    expect(tag(producer, 'django_q2.worker')).toBeUndefined();
+    expect(tag(producer, 'messaging.client.id')).toBeUndefined();
+  });
+
   test('PRODUCER span covers broker publish — not the old near-zero duration', async ({ request }) => {
     // Proves gap #2 fix: the wrap brackets broker.enqueue, so the PRODUCER span
     // has a real (>0) duration. Old behaviour would have surfaced ~0 µs here.

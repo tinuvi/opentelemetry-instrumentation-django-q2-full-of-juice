@@ -45,11 +45,15 @@ docker compose down --volumes
 playwright/
 ├── helpers/
 │   ├── data.ts        # unique(prefix) — per-test correlation id used as trigger_span
-│   └── jaeger.ts      # Jaeger query API client + tree helpers
+│   ├── jaeger.ts      # Jaeger query API client + tree helpers
+│   └── prometheus.ts  # OTel collector scrape helpers (parser + polling fetch)
 ├── tests/
-│   ├── producer-consumer.spec.ts   # single task: HTTP → PRODUCER → CONSUMER
-│   ├── cascading.spec.ts           # scenarios 2 and 3 from HANDOFF.md
-│   └── error-handling.spec.ts      # failing task → consumer span ERROR status
+│   ├── producer-consumer.spec.ts   # single task: HTTP → PRODUCER → CONSUMER, group, worker identifier
+│   ├── cascading.spec.ts           # multi-layer cascade keeps one trace
+│   ├── durations.spec.ts           # real broker-publish + consumer-side wall time
+│   ├── error-handling.spec.ts      # failing task → consumer span ERROR status + exception event
+│   ├── attributes.spec.ts          # django_q2.* attribute pack (hook, ack_failure, ...)
+│   └── metrics.spec.ts             # django_q2.task.duration histogram from the OTel collector
 ├── playwright.config.ts            # baseURL = $SAMPLE_PROJECT_URL or localhost:8000
 ├── tsconfig.json
 └── package.json
@@ -75,11 +79,12 @@ alone.
 
 ## Environment
 
-| Env var               | Default                  | Meaning                                  |
-|-----------------------|--------------------------|------------------------------------------|
-| `SAMPLE_PROJECT_URL`  | `http://localhost:8000`  | Where the sample's web service is reachable. |
-| `JAEGER_URL`          | `http://localhost:16686` | Where Jaeger's UI + Query API is reachable. |
-| `CI`                  | unset                    | Switches reporters to `html` + `github`, enables retries, forbids `test.only`. |
+| Env var                    | Default                  | Meaning                                  |
+|----------------------------|--------------------------|------------------------------------------|
+| `SAMPLE_PROJECT_URL`       | `http://localhost:8000`  | Where the sample's web service is reachable. |
+| `JAEGER_URL`               | `http://localhost:16686` | Where Jaeger's UI + Query API is reachable. |
+| `COLLECTOR_PROMETHEUS_URL` | `http://localhost:8889`  | Where the OTel collector exposes Prometheus-format metrics (used by `metrics.spec.ts`). |
+| `CI`                       | unset                    | Switches reporters to `html` + `github`, enables retries, forbids `test.only`. |
 
 ## CI
 
