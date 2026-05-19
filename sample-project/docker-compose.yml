@@ -1,13 +1,13 @@
 services:
   jaeger:
     # all-in-one >= 1.35 ships an OTLP receiver (gRPC :4317, HTTP :4318) and the
-    # Query API + UI on :16686. No collector needed.
+    # Query API + UI on :16686. No collector needed for traces.
     image: jaegertracing/all-in-one:1.63.0
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
       - "16686:16686"   # UI + Query API (used by Playwright)
-      - "4317:4317"     # OTLP gRPC (used by sample web/worker)
+      - "4317:4317"     # OTLP gRPC (used by sample web/worker for traces)
       - "4318:4318"     # OTLP HTTP (handy for ad-hoc curl)
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
@@ -15,6 +15,20 @@ services:
       timeout: 3s
       retries: 12
       start_period: 5s
+
+  otel-collector:
+    # Metrics-only fanout: receives OTLP from web+worker, re-exposes Prometheus
+    # at :8889 so Playwright can scrape and assert the histogram landed.
+    # The contrib image is distroless — no shell, so no exec-based healthcheck.
+    # `docker compose --wait` still waits for the container to be "running",
+    # and Playwright polls /metrics until the histogram appears.
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "8889:8889"     # Prometheus exposition (consumed by Playwright)
+      - "13133:13133"   # health check (HTTP, accessible from host if needed)
 
   web:
     build:
@@ -33,7 +47,12 @@ services:
       SAMPLE_DATA_DIR: /data
       Q_CLUSTER_NAME: sample-cluster
       Q_CLUSTER_WORKERS: "2"
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4317"
+      # Traces go straight to Jaeger; metrics route through the collector and
+      # surface on its Prometheus endpoint. Splitting the endpoints is the
+      # standard OTel knob — both *_TRACES_ENDPOINT and *_METRICS_ENDPOINT are
+      # honored by the OTLP exporters individually.
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://jaeger:4317"
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://otel-collector:4317"
       OTEL_EXPORTER_OTLP_PROTOCOL: grpc
       OTEL_EXPORTER_OTLP_INSECURE: "true"
       OTEL_SERVICE_NAME: sample-web
@@ -41,6 +60,8 @@ services:
     depends_on:
       jaeger:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/').read()"]
       interval: 5s
@@ -56,6 +77,8 @@ services:
     depends_on:
       web:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     volumes:
       - sample-data:/data
     environment:

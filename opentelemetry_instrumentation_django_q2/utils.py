@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -46,3 +47,41 @@ def describe_func(func: Any) -> str:
     if qualname:
         return qualname
     return repr(func)
+
+
+# Format produced by django_q/worker.py: f"{e} : {traceback.format_exc()}".
+# Splitting on the first " : " separates the message from the formatted traceback,
+# and the traceback's last non-empty line is `ExceptionClassName: message`.
+_WORKER_RESULT_SEP = " : "
+_EXCEPTION_TYPE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*)\s*:")
+
+
+def parse_worker_result(result: Any) -> tuple[str | None, str | None, str | None]:
+    """
+    Return (message, exception_type, stacktrace) from a worker failure result.
+
+    Defensive: any of the fields can be None when the input doesn't parse cleanly
+    (e.g. when post_execute_in_worker fires in the sync-error branch before the
+    formatted result is stored).
+    """
+    if result is None:
+        return None, None, None
+    text = result if isinstance(result, str) else str(result)
+    head, sep, tail = text.partition(_WORKER_RESULT_SEP)
+    if not sep:
+        return text or None, None, None
+    message = head or None
+    stacktrace = tail or None
+    exception_type = _extract_exception_type(tail)
+    return message, exception_type, stacktrace
+
+
+def _extract_exception_type(stacktrace: str) -> str | None:
+    for line in reversed(stacktrace.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = _EXCEPTION_TYPE_RE.match(stripped)
+        if match:
+            return match.group(1)
+    return None
