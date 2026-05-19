@@ -8,7 +8,7 @@ import logging
 from django.http import HttpRequest, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
-from django_q.tasks import async_task
+from django_q.tasks import async_chain, async_iter, async_task
 from opentelemetry import trace
 
 from tasks_app.tasks import TASK_REGISTRY
@@ -44,3 +44,66 @@ def enqueue(request: HttpRequest) -> JsonResponse:
         trace_id_hex = format(span.get_span_context().trace_id, "032x")
 
     return JsonResponse({"task_id": task_id, "task": name, "trace_id": trace_id_hex})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def enqueue_chain(request: HttpRequest) -> JsonResponse:
+    """Enqueue a sequential chain via django-q2's async_chain — exercises django_q2.chain_length."""
+    try:
+        body = json.loads(request.body or b"{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "invalid_json"}, status=400)
+
+    raw_chain = body.get("chain", [])
+    if not isinstance(raw_chain, list) or not raw_chain:
+        return JsonResponse({"error": "chain_must_be_non_empty_list"}, status=400)
+
+    chain: list[tuple] = []
+    for entry in raw_chain:
+        name = entry.get("task")
+        if name not in TASK_REGISTRY:
+            return JsonResponse({"error": "unknown_task", "name": name, "available": sorted(TASK_REGISTRY)}, status=400)
+        # django-q2's async_chain expects (func, args, kwargs) tuples.
+        chain.append((TASK_REGISTRY[name], tuple(entry.get("args", [])), entry.get("kwargs", {})))
+
+    span_name = body.get("trigger_span", "HTTP POST /api/enqueue-chain/")
+    # Capture length BEFORE calling async_chain — django-q2's implementation
+    # pops entries off the list as it enqueues them, so a post-call `len(chain)`
+    # is misleading.
+    chain_length = len(chain)
+    with _tracer.start_as_current_span(span_name) as span:
+        group_id = async_chain(chain, sync=False)
+        trace_id_hex = format(span.get_span_context().trace_id, "032x")
+
+    return JsonResponse({"group_id": group_id, "trace_id": trace_id_hex, "chain_length": chain_length})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def enqueue_iter(request: HttpRequest) -> JsonResponse:
+    """Enqueue an iterable batch via async_iter — exercises django_q2.iter_count."""
+    try:
+        body = json.loads(request.body or b"{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "invalid_json"}, status=400)
+
+    name = body.get("task")
+    if name not in TASK_REGISTRY:
+        return JsonResponse({"error": "unknown_task", "available": sorted(TASK_REGISTRY)}, status=400)
+
+    args_iter = body.get("args_iter", [])
+    if not isinstance(args_iter, list) or not args_iter:
+        return JsonResponse({"error": "args_iter_must_be_non_empty_list"}, status=400)
+
+    # async_iter expects an iterable of arg-tuples for the same target function.
+    arg_tuples = [tuple(entry) for entry in args_iter]
+
+    span_name = body.get("trigger_span", "HTTP POST /api/enqueue-iter/")
+    with _tracer.start_as_current_span(span_name) as span:
+        # `sync` defaults to False in async_iter; pass it explicitly so the test
+        # exercises the same code path as a real worker.
+        task_id = async_iter(TASK_REGISTRY[name], arg_tuples, sync=False)
+        trace_id_hex = format(span.get_span_context().trace_id, "032x")
+
+    return JsonResponse({"task_id": task_id, "trace_id": trace_id_hex, "iter_count": len(arg_tuples)})

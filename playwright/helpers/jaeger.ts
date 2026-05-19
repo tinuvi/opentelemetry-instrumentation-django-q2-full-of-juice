@@ -174,6 +174,30 @@ export async function enqueueTask(
   return (await res.json()) as { task_id: string; task: string; trace_id: string };
 }
 
+export interface ChainEntry {
+  task: string;
+  args?: unknown[];
+  kwargs?: Record<string, unknown>;
+}
+
+export async function enqueueChain(
+  request: APIRequestContext,
+  body: { trigger_span: string; chain: ChainEntry[] },
+): Promise<{ group_id: string; trace_id: string; chain_length: number }> {
+  const res = await request.post('/api/enqueue-chain/', { data: body });
+  expect(res.ok(), `enqueue-chain failed: ${res.status()} ${await res.text()}`).toBeTruthy();
+  return (await res.json()) as { group_id: string; trace_id: string; chain_length: number };
+}
+
+export async function enqueueIter(
+  request: APIRequestContext,
+  body: { task: string; trigger_span: string; args_iter: unknown[][] },
+): Promise<{ task_id: string; trace_id: string; iter_count: number }> {
+  const res = await request.post('/api/enqueue-iter/', { data: body });
+  expect(res.ok(), `enqueue-iter failed: ${res.status()} ${await res.text()}`).toBeTruthy();
+  return (await res.json()) as { task_id: string; trace_id: string; iter_count: number };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }

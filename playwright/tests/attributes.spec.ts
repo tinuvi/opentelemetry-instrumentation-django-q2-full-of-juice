@@ -68,4 +68,71 @@ test.describe('django_q2.* attribute pack', () => {
       expect(tag(span, 'django_q2.chain_length')).toBeUndefined();
     }
   });
+
+  test('cached flag flows to django_q2.cached on both spans', async ({ request }) => {
+    // `cached=60` enables django-q2's result cache for 60 s. The instrumentor
+    // records the attribute as a boolean — we deliberately don't surface the
+    // numeric TTL because dashboards care about "was caching on?" not the value.
+    const trigger = unique('e2e-attr-cached');
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+      kwargs: { cached: 60 },
+    });
+
+    const trace = await fetchTraceWhenReady(enqueue.trace_id, 3);
+    const producer = spanByOperation(trace, 'async_task/tasks_app.tasks.noop');
+    const consumer = spanByOperation(trace, 'run/tasks_app.tasks.noop');
+
+    expect(tag(producer, 'django_q2.cached')).toBe(true);
+    expect(tag(consumer, 'django_q2.cached')).toBe(true);
+  });
+
+  test('django_q2.task.name is present (django-q2 auto-generates one)', async ({ request }) => {
+    // django-q2 stamps `task["name"]` either from the caller's `task_name` kwarg
+    // or by auto-generating a UUID-derived label. Either way the instrumentor
+    // surfaces it as `django_q2.task.name` so dashboards have a stable per-task
+    // identifier without needing the unbounded `messaging.message.id`.
+    const trigger = unique('e2e-attr-taskname');
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+    });
+
+    const trace = await fetchTraceWhenReady(enqueue.trace_id, 3);
+    const producer = spanByOperation(trace, 'async_task/tasks_app.tasks.noop');
+    const consumer = spanByOperation(trace, 'run/tasks_app.tasks.noop');
+
+    const producerName = tag(producer, 'django_q2.task.name');
+    expect(typeof producerName).toBe('string');
+    expect(String(producerName)).not.toBe('');
+    // Producer and consumer must agree on the name — they're observing the
+    // same task dict through the carrier.
+    expect(tag(consumer, 'django_q2.task.name')).toBe(producerName);
+  });
+
+  test('caller-supplied task_name kwarg surfaces verbatim on both spans', async ({ request }) => {
+    // Confirms the dot-namespaced attribute reflects what the caller asked for,
+    // not just the auto-generated UUID label.
+    const trigger = unique('e2e-attr-taskname-explicit');
+    const explicitName = `named-${Date.now()}`;
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+      kwargs: { task_name: explicitName },
+    });
+
+    const trace = await fetchTraceWhenReady(enqueue.trace_id, 3);
+    const producer = spanByOperation(trace, 'async_task/tasks_app.tasks.noop');
+    const consumer = spanByOperation(trace, 'run/tasks_app.tasks.noop');
+
+    expect(tag(producer, 'django_q2.task.name')).toBe(explicitName);
+    expect(tag(consumer, 'django_q2.task.name')).toBe(explicitName);
+  });
 });

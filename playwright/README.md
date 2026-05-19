@@ -45,19 +45,31 @@ docker compose down --volumes
 playwright/
 ├── helpers/
 │   ├── data.ts        # unique(prefix) — per-test correlation id used as trigger_span
-│   ├── jaeger.ts      # Jaeger query API client + tree helpers
+│   ├── jaeger.ts      # Jaeger query API client + tree helpers + enqueue/enqueueChain/enqueueIter
 │   └── prometheus.ts  # OTel collector scrape helpers (parser + polling fetch)
 ├── tests/
 │   ├── producer-consumer.spec.ts   # single task: HTTP → PRODUCER → CONSUMER, group, worker identifier
 │   ├── cascading.spec.ts           # multi-layer cascade keeps one trace
 │   ├── durations.spec.ts           # real broker-publish + consumer-side wall time
 │   ├── error-handling.spec.ts      # failing task → consumer span ERROR status + exception event
-│   ├── attributes.spec.ts          # django_q2.* attribute pack (hook, ack_failure, ...)
-│   └── metrics.spec.ts             # django_q2.task.duration histogram from the OTel collector
+│   ├── attributes.spec.ts          # django_q2.* attribute pack (hook, ack_failure, cached, task.name, ...)
+│   ├── state.spec.ts               # django_q2.state on consumer (success / error / cascade)
+│   ├── chain.spec.ts               # async_chain → decreasing django_q2.chain_length per layer
+│   ├── iter.spec.ts                # async_iter → django_q2.iter_count on the umbrella task
+│   └── metrics.spec.ts             # django_q2.task.duration + django_q2.publish.duration histograms
 ├── playwright.config.ts            # baseURL = $SAMPLE_PROJECT_URL or localhost:8000
 ├── tsconfig.json
 └── package.json
 ```
+
+## Sample-project HTTP surface used by the suite
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/enqueue/` | `async_task(...)` — most tests use this. Body: `{ task, trigger_span, args?, kwargs? }`. |
+| `POST /api/enqueue-chain/` | `async_chain([(func, args, kwargs), ...])` — exercises `django_q2.chain_length`. |
+| `POST /api/enqueue-iter/` | `async_iter(func, [(args,), ...])` — exercises `django_q2.iter_count`. |
+| `GET /health/` | Compose readiness probe. |
 
 `fullyParallel: false` + `workers: 1` keeps the harness honest — the sample has a
 single django-q2 cluster and per-test isolation already comes from the unique

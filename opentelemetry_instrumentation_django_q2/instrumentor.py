@@ -52,12 +52,26 @@ _PRODUCER_OP = MessagingOperationTypeValues.PUBLISH.value
 _CONSUMER_OP = MessagingOperationTypeValues.PROCESS.value
 _SCHEMA_URL = "https://opentelemetry.io/schemas/1.28.0"
 _TASK_DURATION_METRIC = "django_q2.task.duration"
+_PUBLISH_DURATION_METRIC = "django_q2.publish.duration"
+_STATE_SUCCESS = "success"
+_STATE_ERROR = "error"
 
 # Set by _wrap_async_task while it runs, read by _on_pre_enqueue. Lets the signal
 # handler tell "wrap is live, enrich its span" from "wrap was bypassed (caller
 # pre-imported async_task before instrument() ran), fall back to a tiny span".
 _ACTIVE_PRODUCER_SPAN: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "_otel_django_q2_active_producer_span",
+    default=None,
+)
+
+# Mirrors the destination value `_on_pre_enqueue` writes onto the span so the
+# wrap's finally block can label the publish histogram with the *resolved*
+# cluster (django-q2 fills task["cluster"] in from Q_CLUSTER defaults when the
+# caller didn't pass `cluster=`). Without this we'd record histogram samples
+# under `default` while the span carries `sample-cluster` — same task, two
+# stories. Reset alongside _ACTIVE_PRODUCER_SPAN to stay symmetric.
+_RESOLVED_DESTINATION: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_otel_django_q2_resolved_destination",
     default=None,
 )
 
@@ -108,6 +122,16 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
             unit="s",
             description="Wall-clock time spent running a django-q2 task in the worker.",
         )
+        # Producer-side counterpart. Recorded from the async_task wrap so it sees
+        # the same span the PRODUCER kind covers — broker.enqueue + signing roundtrip
+        # in async mode, full inline run in sync mode. Celery records only the
+        # consumer-side; we expose both so operators can spot a slow broker
+        # (publish.duration high, task.duration normal) vs slow workers.
+        self._task_publish_duration_histogram = meter.create_histogram(
+            name=_PUBLISH_DURATION_METRIC,
+            unit="s",
+            description="Wall-clock time spent publishing a django-q2 task from the producer.",
+        )
 
         # Wrap the public entry point so the PRODUCER span brackets the full call,
         # including `broker.enqueue(...)`. pre_enqueue alone would give us a span
@@ -154,12 +178,37 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         # captures it as the carrier's traceparent; end_on_exit closes the span after
         # broker.enqueue returns (or _sync finishes in sync mode) — that's the win
         # over the old approach: real broker-publish duration on the span.
-        token = _ACTIVE_PRODUCER_SPAN.set(span)
+        span_token = _ACTIVE_PRODUCER_SPAN.set(span)
+        # Seed the resolved destination with the caller's kwarg — pre_enqueue may
+        # overwrite this with the task-dict-resolved cluster once it fires.
+        dest_token = _RESOLVED_DESTINATION.set(kwargs.get("cluster") or _DEFAULT_DESTINATION)
+        publish_status = _STATE_SUCCESS
+        start_time = default_timer()
         try:
             with trace.use_span(span, end_on_exit=True):
-                return wrapped(*args, **kwargs)
+                try:
+                    return wrapped(*args, **kwargs)
+                except BaseException:
+                    # Broker publish failed (signing error, DB unreachable, validation,
+                    # ...). Tag the histogram before re-raising so dashboards can split
+                    # publish failures from publish successes.
+                    publish_status = _STATE_ERROR
+                    raise
         finally:
-            _ACTIVE_PRODUCER_SPAN.reset(token)
+            _ACTIVE_PRODUCER_SPAN.reset(span_token)
+            # Read before resetting so we observe the value pre_enqueue stored, not
+            # the default we started with.
+            destination = _RESOLVED_DESTINATION.get() or _DEFAULT_DESTINATION
+            _RESOLVED_DESTINATION.reset(dest_token)
+            duration = max(default_timer() - start_time, 0.0)
+            self._task_publish_duration_histogram.record(
+                duration,
+                attributes={
+                    MESSAGING_DESTINATION_NAME: destination,
+                    "django_q2.func": func_repr,
+                    "status": publish_status,
+                },
+            )
 
     def _on_pre_enqueue(self, sender: Any, task: dict, **_: Any) -> None:
         active = _ACTIVE_PRODUCER_SPAN.get()
@@ -167,6 +216,15 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
             # Wrap is live — enrich the long-lived PRODUCER span with task-derived
             # bits that only exist now (id, name, group, resolved cluster, ...).
             self._apply_task_attributes(active, task)
+            # Mirror the cluster the consumer side will see (django-q2's pusher.py
+            # stamps `task["cluster"] = Conf.CLUSTER_NAME` server-side after the
+            # broker pop). If the caller didn't pass `cluster=` and Q_CLUSTER is
+            # configured, look it up so the producer span + publish histogram and
+            # the consumer span + task histogram all carry the same destination.
+            resolved_cluster = task.get("cluster") or _read_configured_cluster_name()
+            if resolved_cluster:
+                active.set_attribute(MESSAGING_DESTINATION_NAME, resolved_cluster)
+                _RESOLVED_DESTINATION.set(resolved_cluster)
             self._inject_carrier(task)
             return
 
@@ -268,7 +326,12 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
             context=tracectx,
             kind=trace.SpanKind.CONSUMER,
         )
-        self._set_messaging_basics(span, _CONSUMER_OP, task.get("cluster"), func_repr)
+        # Resolve the destination: prefer the cluster pusher.py stamped on the task,
+        # otherwise fall back to Q_CLUSTER's name (matches the producer side and
+        # keeps sync-mode runs — where the broker pusher never fires — consistent
+        # with async-mode runs).
+        consumer_destination = task.get("cluster") or _read_configured_cluster_name()
+        self._set_messaging_basics(span, _CONSUMER_OP, consumer_destination, func_repr)
         self._apply_task_attributes(span, task)
         if self._worker_name and span.is_recording():
             # Captured once by `post_spawn` in this worker process. Both keys are
@@ -294,8 +357,17 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
 
         span, activation, token = ctx
         try:
-            if span.is_recording() and task.get("success") is False:
-                _record_failure(span, task.get("result"))
+            success = task.get("success")
+            if span.is_recording():
+                # Mirror of Celery's `celery.state` — lets dashboards filter on the
+                # terminal state without parsing the OTel status code. Deliberately
+                # left absent in the sync-error branch (success is None), matching
+                # the existing "no error event, no error status" behaviour there.
+                if success is True:
+                    span.set_attribute("django_q2.state", _STATE_SUCCESS)
+                elif success is False:
+                    span.set_attribute("django_q2.state", _STATE_ERROR)
+                    _record_failure(span, task.get("result"))
         finally:
             activation.__exit__(None, None, None)
             if token is not None:
@@ -310,11 +382,13 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         func_repr = describe_func(task.get("func") if task.get("func") is not None else func)
         # Keep cardinality bounded: destination + func + status only. Task name and
         # task id are deliberately excluded — they would explode cardinality on any
-        # non-trivial workload.
+        # non-trivial workload. Destination falls through the same resolution as
+        # the consumer span so both telemetry channels agree.
+        destination = task.get("cluster") or _read_configured_cluster_name() or _DEFAULT_DESTINATION
         attributes = {
-            MESSAGING_DESTINATION_NAME: task.get("cluster") or _DEFAULT_DESTINATION,
+            MESSAGING_DESTINATION_NAME: destination,
             "django_q2.func": func_repr,
-            "status": "error" if task.get("success") is False else "success",
+            "status": _STATE_ERROR if task.get("success") is False else _STATE_SUCCESS,
         }
         self._task_duration_histogram.record(duration, attributes=attributes)
 
@@ -324,6 +398,20 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         # which worker process produced it.
         self._worker_name = proc_name
         _logger.debug("django-q2 worker process spawned: %s", proc_name)
+
+
+def _read_configured_cluster_name() -> str | None:
+    """Return Q_CLUSTER's configured name if django-q2 is loadable, else None."""
+    try:
+        # Imported lazily — Django settings may not be fully bootstrapped yet when
+        # the BaseInstrumentor runs, and tests sometimes drive signals directly
+        # without a populated Q_CLUSTER (we don't want a fragile import to surface
+        # as an instrumentation failure on those paths).
+        from django_q.conf import Conf
+    except Exception:
+        return None
+    name = getattr(Conf, "CLUSTER_NAME", None)
+    return name if name else None
 
 
 def _record_failure(span, result: Any) -> None:

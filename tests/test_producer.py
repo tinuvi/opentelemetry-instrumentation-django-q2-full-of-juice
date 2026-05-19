@@ -65,11 +65,15 @@ class ProducerSpanLifecycleTests(TestBase, TestCase):
         self.assertIn("messaging.message.id", producer.attributes)
         self.assertIn("django_q2.task.name", producer.attributes)
 
-    def test_producer_span_uses_default_destination_when_no_cluster(self):
+    def test_producer_span_resolves_destination_to_configured_cluster_name(self):
+        # When the caller doesn't pass `cluster=`, the producer span lands on the
+        # configured Q_CLUSTER name (django-q2's pusher does the same server-side
+        # via `task["cluster"] = Conf.CLUSTER_NAME`). The "default" sentinel only
+        # surfaces if Q_CLUSTER isn't configured at all.
         async_task("tests.fixtures.noop", sync=True)
 
         producer = self._producer_span()
-        self.assertEqual(producer.attributes["messaging.destination.name"], "default")
+        self.assertEqual(producer.attributes["messaging.destination.name"], "test-cluster")
 
     def test_producer_span_omits_conversation_id_when_no_group(self):
         async_task("tests.fixtures.noop", sync=True)

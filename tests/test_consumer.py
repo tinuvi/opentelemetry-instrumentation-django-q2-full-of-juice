@@ -208,6 +208,9 @@ class PostExecuteInWorkerEndTests(TestBase):
         consumer = next(s for s in spans if s.kind == trace.SpanKind.CONSUMER)
         self.assertEqual(consumer.status.status_code, StatusCode.UNSET)
         self.assertEqual(consumer.events, ())
+        # Mirror of Celery's `celery.state` — lets dashboards filter terminal state
+        # without parsing the OTel status code.
+        self.assertEqual(consumer.attributes["django_q2.state"], "success")
         self.assertIsNone(retrieve_task_context(task["id"]))
 
     def test_failure_records_exception_event_with_type_message_stacktrace(self):
@@ -226,6 +229,7 @@ class PostExecuteInWorkerEndTests(TestBase):
         consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
         self.assertEqual(consumer.status.status_code, StatusCode.ERROR)
         self.assertEqual(consumer.status.description, "boom!")
+        self.assertEqual(consumer.attributes["django_q2.state"], "error")
         self.assertEqual(len(consumer.events), 1)
         event = consumer.events[0]
         self.assertEqual(event.name, "exception")
@@ -262,6 +266,9 @@ class PostExecuteInWorkerEndTests(TestBase):
         consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
         self.assertEqual(consumer.status.status_code, StatusCode.UNSET)
         self.assertEqual(consumer.events, ())
+        # No `django_q2.state` either — we don't have a terminal state to record,
+        # and inventing one would mislead dashboards.
+        self.assertNotIn("django_q2.state", consumer.attributes)
 
     def test_post_execute_without_prior_pre_execute_is_noop(self):
         task = self._build_task()

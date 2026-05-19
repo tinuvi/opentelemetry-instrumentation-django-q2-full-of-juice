@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - Unreleased
 
 ### Added
+- `django_q2.state` attribute on every CONSUMER span — `"success"` when `task["success"]` is `True`, `"error"` when it's `False`. Mirrors Celery's `celery.state` so dashboards can split terminal outcomes without parsing the OTel status code. Deliberately left absent in the sync-error branch (`task["success"]` not set) so the attribute never lies.
+- `django_q2.publish.duration` histogram (unit: seconds, labels: `messaging.destination.name`, `django_q2.func`, `status="success"|"error"`) recorded from the `async_task` wrap. Producer-side counterpart of `django_q2.task.duration` — lets operators tell a slow broker (`publish.duration` high, `task.duration` normal) from slow workers.
 - Initial project scaffolding for `opentelemetry-instrumentation-django-q2-full-of-juice`.
 - `DjangoQ2Instrumentor` wired against django-q2's `pre_enqueue`, `pre_execute`, `post_execute_in_worker`, and `post_spawn` signals.
 - Producer span (`async_task/<func>`, `SpanKind.PRODUCER`) emitted from `pre_enqueue`; the trace context is injected into `task["otel_carrier"]` so it survives pickling and ships through the broker.

@@ -9,6 +9,8 @@ import { countMatching, fetchPrometheusUntil } from '../helpers/prometheus';
 // the same dot-to-underscore rule, so `django_q2.func` becomes `django_q2_func`.
 const HISTOGRAM_COUNT = 'django_q2_task_duration_seconds_count';
 const HISTOGRAM_SUM = 'django_q2_task_duration_seconds_sum';
+const PUBLISH_HISTOGRAM_COUNT = 'django_q2_publish_duration_seconds_count';
+const PUBLISH_HISTOGRAM_SUM = 'django_q2_publish_duration_seconds_sum';
 
 test.describe('metrics — django_q2.task.duration', () => {
   test('successful task records one histogram sample with status=success', async ({ request }) => {
@@ -94,5 +96,93 @@ test.describe('metrics — django_q2.task.duration', () => {
       messaging_destination_name: 'sample-cluster',
     });
     expect(count).toBeGreaterThanOrEqual(1);
+  });
+});
+
+test.describe('metrics — django_q2.publish.duration', () => {
+  // Producer-side counterpart of `task.duration`. The async_task wrap times
+  // broker.enqueue + signing in async mode, so it must record on every publish.
+  test('successful enqueue records one publish sample with status=success', async ({ request }) => {
+    const trigger = unique('e2e-publish-metric-success');
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+    });
+
+    // Wait for the trace to ensure the enqueue path completed end-to-end before
+    // scraping — same shape as the consumer-side metric tests above.
+    await fetchTraceWhenReady(enqueue.trace_id, 3);
+
+    const samples = await fetchPrometheusUntil(s =>
+      countMatching(s, PUBLISH_HISTOGRAM_COUNT, {
+        django_q2_func: 'tasks_app.tasks.noop',
+        status: 'success',
+      }) >= 1,
+    );
+
+    const count = countMatching(samples, PUBLISH_HISTOGRAM_COUNT, {
+      django_q2_func: 'tasks_app.tasks.noop',
+      status: 'success',
+    });
+    expect(count).toBeGreaterThanOrEqual(1);
+
+    const sum = countMatching(samples, PUBLISH_HISTOGRAM_SUM, {
+      django_q2_func: 'tasks_app.tasks.noop',
+      status: 'success',
+    });
+    // Publish time is small but must be ≥0 — sanity check that the unit is right.
+    expect(sum).toBeGreaterThanOrEqual(0);
+  });
+
+  test('publish destination label reflects the cluster the producer targets', async ({ request }) => {
+    const trigger = unique('e2e-publish-metric-cluster');
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['cluster-check'],
+    });
+    await fetchTraceWhenReady(enqueue.trace_id, 3);
+
+    const samples = await fetchPrometheusUntil(s =>
+      countMatching(s, PUBLISH_HISTOGRAM_COUNT, {
+        django_q2_func: 'tasks_app.tasks.noop',
+        messaging_destination_name: 'sample-cluster',
+      }) >= 1,
+    );
+
+    const count = countMatching(samples, PUBLISH_HISTOGRAM_COUNT, {
+      django_q2_func: 'tasks_app.tasks.noop',
+      messaging_destination_name: 'sample-cluster',
+    });
+    expect(count).toBeGreaterThanOrEqual(1);
+  });
+
+  test('publish and task histograms both record for the same task', async ({ request }) => {
+    // Single enqueue ⇒ exactly one increment on each histogram. Asserting both
+    // together pins the contract: an operator splitting "is the broker slow" vs
+    // "are the workers slow" needs both samples present for a given func.
+    const trigger = unique('e2e-publish-and-task-both');
+
+    const enqueue = await enqueueTask(request, {
+      task: 'noop',
+      trigger_span: trigger,
+      args: ['hello'],
+    });
+    await fetchTraceWhenReady(enqueue.trace_id, 3);
+
+    await fetchPrometheusUntil(samples => {
+      const publish = countMatching(samples, PUBLISH_HISTOGRAM_COUNT, {
+        django_q2_func: 'tasks_app.tasks.noop',
+        status: 'success',
+      });
+      const consume = countMatching(samples, HISTOGRAM_COUNT, {
+        django_q2_func: 'tasks_app.tasks.noop',
+        status: 'success',
+      });
+      return publish >= 1 && consume >= 1;
+    });
   });
 });
