@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-05-20
+
+### Added
+- Optional `async_chain` continuity for the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork. When the fork's `pre_chain_progress` / `post_chain_progress` signals are importable, the instrumentor connects to them so every chain link lands on the same trace as the chain head — the next link's PRODUCER span parents under the previous link's CONSUMER span, matching the in-task `async_task(...)` cascade shape. Each consumer's `post_execute_in_worker` re-injects `task["otel_carrier"]` with the consumer span's traceparent so the monitor process has the right context to restore on the next link. On upstream `django-q2` (no chain-progress signals) the import is skipped silently and behavior is unchanged: chain links 2..N still start fresh traces.
+- Dependency check now accepts *either* `django-q2 >= 1.10.0` (upstream) *or* `django-q2-full-of-juice >= 0.1.0` (drop-in fork — same `django_q` import package under a different PyPI distribution name). `DjangoQ2Instrumentor` overrides `_check_dependency_conflicts` with an any-of list so installing the fork instead of upstream no longer trips `BaseInstrumentor`'s default all-of check and silently no-ops `instrument()`.
+- `django_q2.attempt` attribute on producer and consumer spans when the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork's pusher stamps `task["attempt"]` on dequeue — `1` on first delivery, `N >= 2` on re-deliveries (the broker re-pops tasks whose lock expired without an ack). Stamped on attempt 1 too so dashboards can filter `attempt > 1` without confusing "no retries" with "no instrumentation"; absent on upstream `django-q2 1.10.x` and in sync mode (pusher is bypassed). Deliberately not added to the histogram labels: most tasks succeed on attempt 1 so the column would be a constant on every series, and removing a metric label later is a breaking change for downstream dashboards.
+
+### Changed
+- Failed-task `exception` events on the consumer span now prefer the live `sys.exc_info()` triple when the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork forwards it as a kwarg on `post_execute_in_worker`. The instrumentor calls `span.record_exception(exc)` per link in the `__cause__` / `__context__` chain, so a `raise B from A` emits one event per cause (each addressable via `exception.type`) and Python 3.11+ `exc.add_note()` annotations surface in `exception.stacktrace`. `otel.status_description` is now `str(exc)` on the outermost exception. On upstream `django-q2` (no `exc_info` kwarg) and on malformed triples the existing single-event string-parse fallback (`parse_worker_result()`) runs unchanged, so the consumer span stays meaningful in both worlds. Dashboards keyed on the exact event count for failures may now see N events instead of 1 on the fork; queries filtering by `exception.type` still work.
+
 ## [0.1.0] - First release
 
 ### Added

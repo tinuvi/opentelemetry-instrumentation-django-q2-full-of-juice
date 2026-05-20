@@ -10,6 +10,10 @@ from typing import Any
 
 from opentelemetry import context as context_api
 from opentelemetry import trace
+from opentelemetry.instrumentation.dependencies import (
+    DependencyConflict,
+    get_dependency_conflicts,
+)
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import unwrap
 from opentelemetry.metrics import get_meter
@@ -32,7 +36,10 @@ from opentelemetry.trace.status import Status, StatusCode
 from wrapt import wrap_function_wrapper
 
 from opentelemetry_instrumentation_django_q2 import utils
-from opentelemetry_instrumentation_django_q2.package import _instruments
+from opentelemetry_instrumentation_django_q2.package import (
+    _instruments,
+    _instruments_any,
+)
 from opentelemetry_instrumentation_django_q2.utils import (
     OTEL_CARRIER_KEY,
     attach_task_context,
@@ -106,9 +113,32 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         # forever, and removing a label later is a breaking change for downstream
         # dashboards. Adding the dimension to spans is non-breaking.
         self._broker_type: str | None = None
+        # Per-chain attach tokens keyed by the just-finished task["id"]. Populated
+        # by `_on_pre_chain_progress` (juice-fork only) and drained by
+        # `_on_post_chain_progress`. Holds the consumer-context attach token so
+        # the next link's PRODUCER span lands as a child of the previous link's
+        # CONSUMER span — matching the in-task async_task cascade shape.
+        self._chain_progress_tokens: dict[str, object] = {}
+        # Flipped True in `_instrument()` iff the juice fork's chain-progress
+        # signals are importable. Lets `_uninstrument()` skip a disconnect that
+        # would raise on upstream django-q2 (where the signals don't exist).
+        self._chain_signals_connected: bool = False
 
     def instrumentation_dependencies(self) -> Collection[str]:
         return _instruments
+
+    def _check_dependency_conflicts(self) -> DependencyConflict | None:
+        # `BaseInstrumentor`'s default `_check_dependency_conflicts` checks
+        # only `instrumentation_dependencies()` (an "all-of" list). Our case
+        # needs "any-of" semantics: upstream `django-q2` and the fork
+        # `django-q2-full-of-juice` ship the same `django_q` import package
+        # under different PyPI distribution names — only one is ever installed,
+        # and either one is enough for the instrumentor to function. Without
+        # this override, installing the fork instead of upstream would surface
+        # as `DependencyConflict: requested "django-q2 >= 1.10.0" but found
+        # "None"` and `instrument()` would silently return without wiring any
+        # signals.
+        return get_dependency_conflicts((), deps_any=_instruments_any)
 
     def _instrument(self, **kwargs) -> None:
         from django_q.signals import (
@@ -163,6 +193,25 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         pre_execute.connect(self._on_pre_execute, weak=False)
         post_execute_in_worker.connect(self._on_post_execute_in_worker, weak=False)
         post_spawn.connect(self._on_post_spawn, weak=False)
+
+        # `tinuvi/django-q2-full-of-juice` adds two signals on top of upstream
+        # so chain progression carries a trace context across links. Upstream
+        # django-q2 doesn't ship these — `ImportError` is the expected outcome
+        # there and degrades cleanly to the existing "chain links 2..N start
+        # fresh traces" behavior. Static type checkers only see upstream stubs,
+        # hence the suppression — the runtime guard above is the real check.
+        try:
+            # pyrefly: ignore  # missing-module-attribute
+            from django_q.signals import post_chain_progress, pre_chain_progress
+        except ImportError:
+            _logger.debug(
+                "django-q2 build does not expose chain-progress signals; "
+                "chain continuity past the first link will not be propagated"
+            )
+        else:
+            pre_chain_progress.connect(self._on_pre_chain_progress, weak=False)
+            post_chain_progress.connect(self._on_post_chain_progress, weak=False)
+            self._chain_signals_connected = True
         _logger.debug("DjangoQ2Instrumentor instrumented")
 
     def _uninstrument(self, **kwargs) -> None:
@@ -179,6 +228,27 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         pre_execute.disconnect(self._on_pre_execute)
         post_execute_in_worker.disconnect(self._on_post_execute_in_worker)
         post_spawn.disconnect(self._on_post_spawn)
+        if self._chain_signals_connected:
+            # Defensive: the juice fork's signals were importable at
+            # `_instrument()` time; in principle the module could be re-imported
+            # against upstream between then and now, so swallow ImportError.
+            try:
+                # pyrefly: ignore  # missing-module-attribute
+                from django_q.signals import post_chain_progress, pre_chain_progress
+
+                pre_chain_progress.disconnect(self._on_pre_chain_progress)
+                post_chain_progress.disconnect(self._on_post_chain_progress)
+            except ImportError:
+                pass
+            self._chain_signals_connected = False
+        # Detach any tokens stranded by an interrupted chain — leaving them
+        # attached would leak the consumer context into unrelated work.
+        for token in self._chain_progress_tokens.values():
+            try:
+                context_api.detach(token)
+            except Exception:
+                _logger.debug("Failed to detach a stranded chain-progress token", exc_info=True)
+        self._chain_progress_tokens.clear()
         clear_task_context()
         self._task_start_times.clear()
         self._worker_name = None
@@ -319,6 +389,30 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         chain = task.get("chain")
         if isinstance(chain, list):
             span.set_attribute("django_q2.chain_length", len(chain))
+        # `task["attempt"]` is stamped by the juice fork's pusher on every
+        # dequeue: 1 on first delivery, 2..N on re-deliveries (the broker
+        # re-pops when the worker didn't ack before `Conf.RETRY` elapsed).
+        # Upstream `django-q2 1.10.x` doesn't populate this field — absent
+        # then stamps no attribute, which is the cleanest "no instrumentation
+        # signal for retries" indicator we can give dashboards.
+        #
+        # Stamped on first delivery too: gating on `>1` would make
+        # "field absent" ambiguous (no retries vs no instrumentation). We pay
+        # one extra constant column on attempt-1 spans for the disambiguation.
+        #
+        # Deliberately not added to histogram labels — most tasks succeed on
+        # attempt 1, so the column would be a constant on every series.
+        # Removing a metric label later is a breaking change for downstream
+        # dashboards; adding it is not. Same argument as `django_q2.broker.type`.
+        #
+        # No semconv-aligned mirror today: opentelemetry-semantic-conventions
+        # ships only vendor-specific keys (GCP Pub/Sub, Azure Service Bus) at
+        # the 1.34.0 pin. A general `messaging.message.delivery.attempt` would
+        # be the natural mirror — revisit when the semconv-python package
+        # exposes one (likely the messaging.message.* incubating namespace).
+        attempt = task.get("attempt")
+        if _is_positive_int(attempt):
+            span.set_attribute("django_q2.attempt", attempt)
         # django-q2's `timeout` accepts an integer number of seconds. We stamp
         # only positive ints so the attribute always represents a real budget
         # and not a `null`/`0` sentinel — dashboards can express "duration / timeout"
@@ -397,7 +491,22 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
         activation.__enter__()
         attach_task_context(task_id, span, activation, token)
 
-    def _on_post_execute_in_worker(self, sender: Any, func: Any, task: dict, **_: Any) -> None:
+    def _on_post_execute_in_worker(
+        self,
+        sender: Any,
+        func: Any,
+        task: dict,
+        exc_info: Any = None,
+        **_: Any,
+    ) -> None:
+        # `exc_info` is the juice fork's `sys.exc_info()` triple, forwarded from
+        # `django_q/worker.py`'s except block (the fork sends `None` on success).
+        # Upstream `django-q2 1.10.x` doesn't send the kwarg at all — the default
+        # keeps the handler signature-compatible there. We prefer the live
+        # exception when it's present (richer event shape: cause chains, notes,
+        # subclass-specific repr) and fall back to parsing `task["result"]`
+        # otherwise — that fallback is the only source of data on upstream and
+        # in the rare juice case where the kwarg is malformed.
         task_id = task.get("id")
         if task_id is None:
             return
@@ -420,7 +529,14 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
                     span.set_attribute("django_q2.state", _STATE_SUCCESS)
                 elif success is False:
                     span.set_attribute("django_q2.state", _STATE_ERROR)
-                    _record_failure(span, task.get("result"))
+                    _record_failure(span, task.get("result"), exc_info)
+            # Overwrite the carrier with a traceparent that points at the CONSUMER
+            # span we're about to close. Done unconditionally — on upstream
+            # django-q2 nothing reads the carrier post-task and the extra dict
+            # write is cheap; on the juice fork it's load-bearing for chain
+            # continuity (the monitor's chain-progress signal will re-extract
+            # this so the next link's PRODUCER span parents under this CONSUMER).
+            self._inject_carrier(task)
         finally:
             activation.__exit__(None, None, None)
             if token is not None:
@@ -444,6 +560,37 @@ class DjangoQ2Instrumentor(BaseInstrumentor):
             "status": _STATE_ERROR if task.get("success") is False else _STATE_SUCCESS,
         }
         self._task_duration_histogram.record(duration, attributes=attributes)
+
+    def _on_pre_chain_progress(self, sender: Any, task: dict, **_: Any) -> None:
+        # Juice-fork-only path. django-q2's monitor process fires this around
+        # `async_chain(...)` after a link completes. The just-finished task's
+        # carrier was re-injected by `_on_post_execute_in_worker` with the
+        # CONSUMER span as current — so attaching it here parents the next
+        # link's PRODUCER span under that CONSUMER span (matching the in-task
+        # async_task cascade shape).
+        carrier = task.get(OTEL_CARRIER_KEY) or {}
+        if not carrier:
+            return
+        tracectx = extract(carrier)
+        if tracectx is None:
+            return
+        token = context_api.attach(tracectx)
+        task_id = task.get("id")
+        if task_id is None:
+            # Without an id we can't pair this attach with the matching
+            # `post_chain_progress` — detach immediately so the context doesn't
+            # leak into subsequent monitor work.
+            context_api.detach(token)
+            return
+        self._chain_progress_tokens[task_id] = token
+
+    def _on_post_chain_progress(self, sender: Any, task: dict, **_: Any) -> None:
+        task_id = task.get("id")
+        if task_id is None:
+            return
+        token = self._chain_progress_tokens.pop(task_id, None)
+        if token is not None:
+            context_api.detach(token)
 
     def _on_post_spawn(self, sender: Any, proc_name: str, **_: Any) -> None:
         # post_spawn fires inside each forked worker exactly once, before the
@@ -523,11 +670,31 @@ def _resolve_broker_type() -> str | None:
     return "redis"
 
 
-def _record_failure(span, result: Any) -> None:
-    # django-q2 only hands us a string — `f"{e} : {traceback.format_exc()}"` from
-    # worker.py — so the live exception object is gone. We parse the string into
-    # type / message / stacktrace and emit a standard OTel `exception` event;
-    # backends like Jaeger/Tempo render that event as the span's error details.
+def _record_failure(span, result: Any, exc_info: Any = None) -> None:
+    # Two paths, picked by which information the producer of the signal had:
+    #
+    # 1. Juice-fork path — `django_q/worker.py` captures `sys.exc_info()` inside
+    #    the except block and forwards it as a signal kwarg. The live exception
+    #    is reachable, so we call `span.record_exception(exc)` per cause link:
+    #    one `exception` event per link in the `__cause__` / `__context__`
+    #    chain, each surfacing Python 3.11+ `add_note()` notes and any
+    #    subclass-specific repr the SDK can resolve — none of which we can
+    #    recover from a string. `record_exception` does NOT set status on its
+    #    own, so we still set `ERROR` ourselves. Description = `str(exc)` on
+    #    the outermost exception so chained exceptions surface the top-level
+    #    message (not the innermost cause's).
+    #
+    # 2. Upstream / fallback path — `django-q2 1.10.x` doesn't pass exc_info
+    #    and only hands us a string (`f"{e} : {traceback.format_exc()}"` from
+    #    worker.py). We regex-parse that into type / message / stacktrace and
+    #    emit one OTel `exception` event manually. Also the path the juice
+    #    code lands on if `exc_info` is malformed (defensive isinstance check
+    #    in `_live_exception_from`).
+    exc = _live_exception_from(exc_info)
+    if exc is not None:
+        _record_exception_chain(span, exc)
+        span.set_status(Status(StatusCode.ERROR, description=str(exc) or None))
+        return
     message, exception_type, stacktrace = parse_worker_result(result)
     span.set_status(Status(StatusCode.ERROR, description=message))
     event_attrs: dict[str, str] = {}
@@ -539,6 +706,51 @@ def _record_failure(span, result: Any) -> None:
         event_attrs[EXCEPTION_STACKTRACE] = stacktrace
     if event_attrs:
         span.add_event("exception", attributes=event_attrs)
+
+
+def _record_exception_chain(span, exc: BaseException) -> None:
+    """
+    Emit one OTel `exception` event per link in `exc`'s cause/context chain.
+
+    OpenTelemetry Python's `Span.record_exception()` only emits a single event;
+    the chain context shows up as text inside `exception.stacktrace`, not as
+    separate structured events. For dashboards that filter on
+    `exception.type=X` to surface chained causes, that single event loses the
+    inner exception's type — Jaeger / Tempo can't show "RuntimeError caused
+    by ValueError" without parsing the stacktrace string.
+
+    We walk the chain ourselves (matching Python's own `__cause__` /
+    `__context__` precedence — `raise X from Y` sets `__cause__` and suppresses
+    `__context__`, otherwise we follow `__context__`) and emit one event per
+    link so each cause stays addressable. The `seen` set guards the (rare)
+    case of a self-referential chain.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        span.record_exception(current)
+        next_link = current.__cause__
+        if next_link is None and not getattr(current, "__suppress_context__", False):
+            next_link = current.__context__
+        current = next_link
+
+
+def _live_exception_from(exc_info: Any) -> BaseException | None:
+    """
+    Return the live exception out of a sys.exc_info()-style triple, or None.
+
+    Guards against the upstream case (no kwarg ⇒ None) and the defensive case
+    where a third party forwards a malformed triple (e.g. a stringified type in
+    the value slot). Either of those falls back to the string-parsing path.
+    """
+    if not exc_info:
+        return None
+    try:
+        exc = exc_info[1]
+    except TypeError, IndexError:
+        return None
+    return exc if isinstance(exc, BaseException) else None
 
 
 __all__ = ["DjangoQ2Instrumentor", "utils"]

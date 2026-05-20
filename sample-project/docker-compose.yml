@@ -86,5 +86,72 @@ services:
       OTEL_SERVICE_NAME: sample-worker
     command: ["./scripts/start-worker.sh"]
 
+  # --- Juice fork stack ---------------------------------------------------
+  # Sister to `web` / `worker` but built against `django-q2-full-of-juice`
+  # instead of upstream `django-q2`. Gated behind the `juice` Docker Compose
+  # profile so the default `docker compose up` keeps booting upstream only;
+  # the Playwright `juice` project explicitly opts in via
+  # `docker compose --profile juice up`. Shares the existing `jaeger` and
+  # `otel-collector` containers — both stacks coexist in one Jaeger, separated
+  # by `service.name` (`juice-web` / `juice-worker` vs `sample-*`).
+  juice-web:
+    profiles: ["juice"]
+    build:
+      context: ..
+      dockerfile: sample-project/Dockerfile.juice
+    image: django-q2-otel-sample-juice:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - juice-sample-data:/data
+    environment: &juice-otel-env
+      DJANGO_SETTINGS_MODULE: sample.settings
+      DJANGO_SECRET_KEY: "juice-sample-project-shared-secret-do-not-use-in-prod"
+      SAMPLE_DATA_DIR: /data
+      Q_CLUSTER_NAME: juice-cluster
+      Q_CLUSTER_WORKERS: "2"
+      # Lower retry + a hard attempt cap so the juice E2E can prove
+      # `task["attempt"]` increments under re-delivery without waiting 90s per
+      # cycle or letting the broker retry forever. Only juice services set
+      # these; upstream services stay on django-q2's defaults.
+      Q_CLUSTER_RETRY: "5"
+      Q_CLUSTER_MAX_ATTEMPTS: "2"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://jaeger:4317"
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: "http://otel-collector:4317"
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+      OTEL_SERVICE_NAME: juice-web
+    command: ["./scripts/start-web.sh"]
+    depends_on:
+      jaeger:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  juice-worker:
+    profiles: ["juice"]
+    image: django-q2-otel-sample-juice:latest
+    build:
+      context: ..
+      dockerfile: sample-project/Dockerfile.juice
+    depends_on:
+      juice-web:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    volumes:
+      - juice-sample-data:/data
+    environment:
+      <<: *juice-otel-env
+      OTEL_SERVICE_NAME: juice-worker
+    command: ["./scripts/start-worker.sh"]
+
 volumes:
   sample-data:
+  juice-sample-data:

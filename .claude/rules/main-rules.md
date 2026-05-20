@@ -33,6 +33,8 @@ Imperative guidance for working on the project. Follow these end-to-end on every
     ```bash
     docker compose run --remove-orphans --rm integration-tests
     ```
+- Before considering a task fully completed, analyze the **Playwright E2E** where specs live under `./playwright/tests/` (upstream `django-q2`) and `./playwright/tests-juice/` (juice fork). Consider adding crucial features. Don't replicate what's been tested in Python, but only vital aspects of the library.
+- **Run both Playwright projects** — the upstream `chromium` project AND the `juice` project — before declaring a change complete. A change that only passes the upstream suite hides juice-fork regressions and vice versa. See `./playwright/README.md` for the exact commands.
 
 ## Lint & format
 

@@ -4,8 +4,10 @@
   "private": true,
   "description": "End-to-end tests for opentelemetry-instrumentation-django-q2-full-of-juice, driven through sample-project against a real Jaeger backend.",
   "scripts": {
-    "test": "playwright test",
-    "test:headed": "playwright test --headed",
+    "test": "playwright test --project=chromium",
+    "test:juice": "playwright test --project=juice",
+    "test:all": "playwright test",
+    "test:headed": "playwright test --project=chromium --headed",
     "test:ui": "playwright test --ui",
     "test:debug": "playwright test --debug",
     "test:report": "playwright show-report",

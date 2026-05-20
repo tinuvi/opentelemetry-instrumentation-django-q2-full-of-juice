@@ -356,6 +356,34 @@ class ProducerExtraAttributeTests(TestBase):
         span = self.memory_exporter.get_finished_spans()[0]
         self.assertNotIn("django_q2.timeout", span.attributes)
 
+    def test_attempt_attribute_set_when_present_in_task_dict(self):
+        # Symmetric with the consumer side. The first PRODUCER span in a web
+        # process won't carry the field (the fork's pusher stamps it on dequeue,
+        # before pre_execute — but pre_enqueue fires *before* the broker
+        # round-trip on the producer end). The field DOES appear on tasks
+        # re-enqueued from inside a worker (chain progression, fan-out from a
+        # consumer), where `task["attempt"]` is already populated. Stamping
+        # symmetrically keeps the attribute pack in lockstep on both ends.
+        self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}, "attempt": 2})
+        span = self.memory_exporter.get_finished_spans()[0]
+        self.assertEqual(span.attributes["django_q2.attempt"], 2)
+
+    def test_attempt_attribute_skipped_when_value_non_positive(self):
+        # Same guard the consumer side uses: 0 / negative / bool / None / non-int
+        # should never land as `django_q2.attempt`. Producer-side coverage is
+        # cheap and pins the shared `_apply_task_attributes` contract.
+        for bad in (0, -1, True, False, None, "1"):
+            with self.subTest(bad=bad):
+                self._send_with_active_producer(
+                    {"id": f"x-{bad}", "func": "f", "args": (), "kwargs": {}, "attempt": bad}
+                )
+                span = next(
+                    s
+                    for s in self.memory_exporter.get_finished_spans()
+                    if s.attributes.get("messaging.message.id") == f"x-{bad}"
+                )
+                self.assertNotIn("django_q2.attempt", span.attributes)
+
     def test_all_optional_attributes_absent_when_task_minimal(self):
         self._send_with_active_producer({"id": "x", "func": "f", "args": (), "kwargs": {}})
         span = self.memory_exporter.get_finished_spans()[0]
@@ -367,5 +395,6 @@ class ProducerExtraAttributeTests(TestBase):
             "django_q2.iter_count",
             "django_q2.chain_length",
             "django_q2.timeout",
+            "django_q2.attempt",
         ):
             self.assertNotIn(key, span.attributes)

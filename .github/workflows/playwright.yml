@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   e2e:
-    name: Playwright tests (chromium)
+    name: Playwright tests (chromium + juice)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -30,8 +30,11 @@ jobs:
           cache: 'npm'
           cache-dependency-path: playwright/package-lock.json
 
-      - name: Bring up sample-project stack (jaeger + web + worker)
-        run: docker compose -f $COMPOSE_FILE up --build --detach --wait --wait-timeout 240
+      - name: Bring up sample-project stack (upstream + juice profiles)
+        # `--profile juice` adds juice-web + juice-worker on top of the default
+        # services. The juice E2E specs (npm run test:juice) need the juice-web
+        # service at :8001; the upstream specs continue using :8000.
+        run: docker compose -f $COMPOSE_FILE --profile juice up --build --detach --wait --wait-timeout 360
 
       - name: Wait for sample-project /health/ to be ready
         run: |
@@ -81,28 +84,52 @@ jobs:
           npm ci --ignore-scripts
           npm run install-browsers -- chromium
 
-      - name: Run Playwright tests
+      - name: Wait for juice-web /health/ to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl --fail --silent http://localhost:8001/health/ > /dev/null; then
+              echo "juice-web is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "juice-web failed to come up"
+          docker compose -f $COMPOSE_FILE --profile juice ps
+          docker compose -f $COMPOSE_FILE --profile juice logs --tail 200 juice-web juice-worker
+          exit 1
+
+      - name: Run Playwright tests (upstream — chromium project)
         working-directory: playwright
         env:
           CI: 'true'
           SAMPLE_PROJECT_URL: http://localhost:8000
           JAEGER_URL: http://localhost:16686
           COLLECTOR_PROMETHEUS_URL: http://localhost:8889
-        run: npm test -- --project=chromium
+        run: npm test
+
+      - name: Run Playwright tests (juice fork — juice project)
+        working-directory: playwright
+        env:
+          CI: 'true'
+          JUICE_SAMPLE_PROJECT_URL: http://localhost:8001
+          JAEGER_URL: http://localhost:16686
+        run: npm run test:juice
 
       - name: Dump compose logs on failure
         if: failure()
         run: |
           mkdir -p /tmp/compose-logs
-          docker compose -f $COMPOSE_FILE logs --no-color > /tmp/compose-logs/all.log
-          docker compose -f $COMPOSE_FILE logs --no-color jaeger > /tmp/compose-logs/jaeger.log || true
-          docker compose -f $COMPOSE_FILE logs --no-color web > /tmp/compose-logs/web.log || true
-          docker compose -f $COMPOSE_FILE logs --no-color worker > /tmp/compose-logs/worker.log || true
-          docker compose -f $COMPOSE_FILE logs --no-color otel-collector > /tmp/compose-logs/otel-collector.log || true
+          docker compose -f $COMPOSE_FILE --profile juice logs --no-color > /tmp/compose-logs/all.log
+          docker compose -f $COMPOSE_FILE --profile juice logs --no-color jaeger > /tmp/compose-logs/jaeger.log || true
+          docker compose -f $COMPOSE_FILE --profile juice logs --no-color web > /tmp/compose-logs/web.log || true
+          docker compose -f $COMPOSE_FILE --profile juice logs --no-color worker > /tmp/compose-logs/worker.log || true
+          docker compose -f $COMPOSE_FILE --profile juice logs --no-color juice-web > /tmp/compose-logs/juice-web.log || true
+          docker compose -f $COMPOSE_FILE --profile juice logs --no-color juice-worker > /tmp/compose-logs/juice-worker.log || true
+          docker compose -f $COMPOSE_FILE --profile juice logs --no-color otel-collector > /tmp/compose-logs/otel-collector.log || true
 
       - name: Tear down compose stack
         if: always()
-        run: docker compose -f $COMPOSE_FILE down --volumes --remove-orphans
+        run: docker compose -f $COMPOSE_FILE --profile juice down --volumes --remove-orphans
 
       - name: Upload Playwright report
         if: always()

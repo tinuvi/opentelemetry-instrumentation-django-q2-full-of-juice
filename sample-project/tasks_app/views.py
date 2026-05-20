@@ -36,12 +36,18 @@ def enqueue(request: HttpRequest) -> JsonResponse:
 
     args = body.get("args", [])
     kwargs = body.get("kwargs", {})
+    # `q_options` carries django-q2's control kwargs (`ack_failure`, `group`,
+    # `hook`, `cluster`, ...) — kept distinct from `kwargs` so the task
+    # function's signature can't collide with a control name. Empty by default.
+    q_options = body.get("q_options", {})
+    if not isinstance(q_options, dict):
+        return JsonResponse({"error": "q_options_must_be_dict"}, status=400)
     # Playwright passes a unique trigger_span per scenario so it can query Jaeger
     # for exactly the trace it just created (Jaeger search: operation = trigger_span).
     span_name = body.get("trigger_span", "HTTP POST /api/enqueue/")
 
     with _tracer.start_as_current_span(span_name) as span:
-        task_id = async_task(TASK_REGISTRY[name], *args, **kwargs)
+        task_id = async_task(TASK_REGISTRY[name], *args, **kwargs, **q_options)
         trace_id_hex = format(span.get_span_context().trace_id, "032x")
 
     return JsonResponse({"task_id": task_id, "task": name, "trace_id": trace_id_hex})

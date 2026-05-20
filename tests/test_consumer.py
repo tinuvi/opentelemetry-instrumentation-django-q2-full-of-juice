@@ -146,12 +146,70 @@ class PreExecuteConsumerStartTests(TestBase):
             "django_q2.hook",
             "django_q2.iter_count",
             "django_q2.chain_length",
+            "django_q2.attempt",
         ):
             self.assertNotIn(key, consumer.attributes)
         # `django_q2.timeout` is the exception in this pack: even with a minimal task,
         # the consumer side falls back to Conf.TIMEOUT — the testapp settings declare
         # `"timeout": 60`, so the attribute IS present despite no task["timeout"].
         self.assertEqual(consumer.attributes["django_q2.timeout"], 60)
+
+    def test_pre_execute_stamps_attempt_attribute_when_present(self):
+        # Juice fork: `django_q/pusher.py` stamps the next-attempt number onto
+        # the task dict before pre_execute fires. The handler reads it
+        # verbatim — including N >= 2 on re-deliveries, which is the whole
+        # reason this attribute exists.
+        task = self._build_task(attempt=3)
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.attributes["django_q2.attempt"], 3)
+
+    def test_pre_execute_stamps_attempt_one_on_first_delivery(self):
+        # Don't gate on `>1`: stamping on attempt 1 too lets dashboards filter
+        # "attempt > 1" themselves AND keeps "field absent" a clean
+        # upstream/sync-mode signal (no instrumentation for retries).
+        task = self._build_task(attempt=1)
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.attributes["django_q2.attempt"], 1)
+
+    def test_pre_execute_omits_attempt_when_absent(self):
+        # Upstream `django-q2 1.10.x` doesn't stamp the field. Sync-mode bypasses
+        # the pusher entirely even on the fork. Either way: no attribute, so
+        # operators reading dashboards know they're not on the fork's pusher path.
+        task = self._build_task()
+        self.assertNotIn("attempt", task)
+
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertNotIn("django_q2.attempt", consumer.attributes)
+
+    def test_pre_execute_ignores_non_positive_attempt(self):
+        # `attempt=0` should never reach us (the fork's formula always yields
+        # >= 1), but the `_is_positive_int` guard turns a defensive accident
+        # into "attribute not stamped" — the safer side. Same shape as the
+        # `timeout` defenses.
+        for bad in (0, -1, True, False, None, "1"):
+            with self.subTest(bad=bad):
+                task = self._build_task(id=f"task-id-attempt-{bad}", attempt=bad)
+                pre_execute.send(sender="django_q", func=lambda: None, task=task)
+                post_execute_in_worker.send(
+                    sender="django_q", func=None, task={**task, "success": True, "result": None}
+                )
+
+                spans = self.memory_exporter.get_finished_spans()
+                consumer = next(
+                    s
+                    for s in spans
+                    if s.kind == trace.SpanKind.CONSUMER and s.attributes.get("messaging.message.id") == task["id"]
+                )
+                self.assertNotIn("django_q2.attempt", consumer.attributes)
 
     def test_pre_execute_sets_broker_type_from_configured_orm_backend(self):
         # testapp settings: `"orm": "default"` ⇒ broker.type resolves to "orm" at
@@ -302,7 +360,10 @@ class PostExecuteInWorkerEndTests(TestBase):
         self.assertEqual(consumer.attributes["django_q2.state"], "success")
         self.assertIsNone(retrieve_task_context(task["id"]))
 
-    def test_failure_records_exception_event_with_type_message_stacktrace(self):
+    def test_failure_without_exc_info_falls_back_to_string_parsing(self):
+        # Upstream `django-q2 1.10.x` doesn't pass an `exc_info` kwarg on
+        # `post_execute_in_worker` — the handler must still recover the
+        # exception shape from `task["result"]` (the regex-parse fallback).
         task = self._build_task()
 
         pre_execute.send(sender="django_q", func=lambda: None, task=task)
@@ -344,6 +405,167 @@ class PostExecuteInWorkerEndTests(TestBase):
         self.assertNotIn("exception.type", event.attributes)
         self.assertNotIn("exception.stacktrace", event.attributes)
 
+    def test_failure_with_live_exception_uses_record_exception(self):
+        # Juice fork path: `django_q/worker.py` forwards `sys.exc_info()` as a
+        # signal kwarg. The handler must prefer the live exception over
+        # `task["result"]` and let the SDK emit the standard `exception` event
+        # via `record_exception`. The status description must be `str(exc)` —
+        # not the `" : "` split prefix from the formatted string — so dashboards
+        # see the exception's real top-level message even when it spans
+        # multiple lines.
+        task = self._build_task()
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+
+        try:
+            raise RuntimeError("boom-live")
+        except RuntimeError:
+            import sys
+
+            live_exc_info = sys.exc_info()
+
+        # `task["result"]` carries a deliberately *different* message so we
+        # can prove the live exception wins. If the handler regressed and used
+        # the string path, the description would be "different-from-live".
+        post_execute_in_worker.send(
+            sender="django_q",
+            func=None,
+            task={**task, "success": False, "result": "different-from-live : ..."},
+            exc_info=live_exc_info,
+        )
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.status.status_code, StatusCode.ERROR)
+        self.assertEqual(consumer.status.description, "boom-live")
+        self.assertEqual(consumer.attributes["django_q2.state"], "error")
+        self.assertEqual(len(consumer.events), 1)
+        event = consumer.events[0]
+        self.assertEqual(event.name, "exception")
+        self.assertEqual(event.attributes["exception.type"], "RuntimeError")
+        self.assertEqual(event.attributes["exception.message"], "boom-live")
+        # The SDK fills `exception.stacktrace` from the live traceback — that's
+        # the bit that's strictly richer than the string-parse fallback (real
+        # frames, no formatting drift).
+        self.assertIn("RuntimeError: boom-live", event.attributes["exception.stacktrace"])
+
+    def test_failure_with_chained_cause_records_each_link(self):
+        # Load-bearing test for why the live-exception path exists at all:
+        # `raise B from A` produces a cause chain (`__cause__`) that the SDK's
+        # `record_exception` walks, emitting one `exception` event per link.
+        # The string-parse fallback can only see the outer exception — without
+        # this assertion, the live path is indistinguishable from the fallback.
+        task = self._build_task()
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+
+        try:
+            try:
+                raise ValueError("inner-cause")
+            except ValueError as inner:
+                raise RuntimeError("outer-failure") from inner
+        except RuntimeError:
+            import sys
+
+            live_exc_info = sys.exc_info()
+
+        post_execute_in_worker.send(
+            sender="django_q",
+            func=None,
+            task={**task, "success": False, "result": "outer-failure : ..."},
+            exc_info=live_exc_info,
+        )
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.status.status_code, StatusCode.ERROR)
+        self.assertEqual(consumer.status.description, "outer-failure")
+        # Two exception events — one per cause link. The order the SDK emits
+        # them in is "outermost first" (the exception we passed, then its
+        # __cause__).
+        self.assertEqual(len(consumer.events), 2)
+        types = [event.attributes["exception.type"] for event in consumer.events]
+        messages = [event.attributes["exception.message"] for event in consumer.events]
+        self.assertIn("RuntimeError", types)
+        self.assertIn("ValueError", types)
+        self.assertIn("outer-failure", messages)
+        self.assertIn("inner-cause", messages)
+
+    def test_failure_with_python_3_11_note_records_note(self):
+        # PEP 678 `add_note()` lets callers attach extra context to an exception
+        # (added in Python 3.11). The SDK's `record_exception` surfaces those
+        # notes in `exception.stacktrace`. Falls back gracefully on older
+        # Pythons (the `add_note` call is guarded), where the note is simply
+        # not present in the emitted event.
+        task = self._build_task()
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+
+        try:
+            exc = RuntimeError("notable-boom")
+            if hasattr(exc, "add_note"):  # Python 3.11+
+                exc.add_note("retryable=True")
+            raise exc
+        except RuntimeError:
+            import sys
+
+            live_exc_info = sys.exc_info()
+
+        post_execute_in_worker.send(
+            sender="django_q",
+            func=None,
+            task={**task, "success": False, "result": "notable-boom : ..."},
+            exc_info=live_exc_info,
+        )
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        event = consumer.events[0]
+        self.assertEqual(event.attributes["exception.type"], "RuntimeError")
+        self.assertEqual(event.attributes["exception.message"], "notable-boom")
+        if hasattr(RuntimeError("x"), "add_note"):
+            self.assertIn("retryable=True", event.attributes["exception.stacktrace"])
+
+    def test_success_path_with_exc_info_none_kwarg_is_noop(self):
+        # The juice fork always passes the kwarg, including `exc_info=None` on
+        # success. The handler must treat that exactly like upstream's no-kwarg
+        # success path: no exception event, no error status, `django_q2.state`
+        # stamped "success".
+        task = self._build_task()
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(
+            sender="django_q",
+            func=None,
+            task={**task, "success": True, "result": 42},
+            exc_info=None,
+        )
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.status.status_code, StatusCode.UNSET)
+        self.assertEqual(consumer.events, ())
+        self.assertEqual(consumer.attributes["django_q2.state"], "success")
+
+    def test_failure_with_malformed_exc_info_falls_back_to_string(self):
+        # Defensive: if a third party (or a future fork variant) forwards a
+        # malformed triple where the value slot isn't a BaseException, the
+        # handler must NOT crash and must fall back to the string-parsing
+        # path so the event is still emitted.
+        task = self._build_task()
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        bad_exc_info = ("RuntimeError", "not-an-exception", None)
+        post_execute_in_worker.send(
+            sender="django_q",
+            func=None,
+            task={
+                **task,
+                "success": False,
+                "result": ("boom-from-string : Traceback (most recent call last):\nRuntimeError: boom-from-string"),
+            },
+            exc_info=bad_exc_info,
+        )
+
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        self.assertEqual(consumer.status.status_code, StatusCode.ERROR)
+        self.assertEqual(consumer.status.description, "boom-from-string")
+        self.assertEqual(len(consumer.events), 1)
+        event = consumer.events[0]
+        self.assertEqual(event.attributes["exception.type"], "RuntimeError")
+        self.assertEqual(event.attributes["exception.message"], "boom-from-string")
+
     def test_sync_error_branch_missing_success_key_is_tolerated(self):
         # Mirrors worker.py:113 — sync error path may emit post_execute_in_worker
         # before task["success"] / task["result"] / task["stopped"] are set.
@@ -366,3 +588,43 @@ class PostExecuteInWorkerEndTests(TestBase):
         post_execute_in_worker.send(sender="django_q", func=None, task=task)
 
         self.assertEqual(self.memory_exporter.get_finished_spans(), ())
+
+    def test_post_execute_reinjects_carrier_with_consumer_span_context(self):
+        # Re-injection is the load-bearing piece of juice-fork chain continuity:
+        # the carrier on the task dict must end with a traceparent that points
+        # at the CONSUMER span we just closed (not the PRODUCER one originally
+        # injected at pre_enqueue time). When `pre_chain_progress` fires for the
+        # next chain link it extracts THIS carrier, so the link parents under
+        # the previous consumer. Done unconditionally — harmless on upstream,
+        # load-bearing on the fork. See HANDOFF.md.
+        original_trace_id = 0x11112222333344445555666677778888
+        original_span_id = 0xAAAABBBBCCCCDDDD
+        task = {
+            "id": "task-id-reinject",
+            "name": "demo",
+            "func": "tests.fixtures.noop",
+            "args": (),
+            "kwargs": {},
+            "cluster": "test-cluster",
+            OTEL_CARRIER_KEY: _carrier_from(original_trace_id, original_span_id),
+        }
+        original_traceparent = task[OTEL_CARRIER_KEY]["traceparent"]
+
+        pre_execute.send(sender="django_q", func=lambda: None, task=task)
+        post_execute_in_worker.send(sender="django_q", func=None, task={**task, "success": True, "result": None})
+
+        # 1. The carrier was overwritten — comparing the two traceparents
+        # surfaces any silent regression where re-injection stops happening.
+        new_traceparent = task[OTEL_CARRIER_KEY]["traceparent"]
+        self.assertNotEqual(new_traceparent, original_traceparent)
+
+        # 2. The new traceparent's span_id portion is the CONSUMER span's id, and
+        # the trace_id portion is preserved (same trace — that's the whole point).
+        consumer = next(s for s in self.memory_exporter.get_finished_spans() if s.kind == trace.SpanKind.CONSUMER)
+        consumer_ctx = consumer.get_span_context()
+        # traceparent format: 00-<trace_id_32>-<span_id_16>-<flags_2>
+        parts = new_traceparent.split("-")
+        self.assertEqual(parts[1], format(consumer_ctx.trace_id, "032x"))
+        self.assertEqual(parts[2], format(consumer_ctx.span_id, "016x"))
+        # And explicitly NOT the producer's original span_id.
+        self.assertNotEqual(parts[2], format(original_span_id, "016x"))

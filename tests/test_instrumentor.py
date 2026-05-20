@@ -42,6 +42,66 @@ class DjangoQ2InstrumentorTests(TestCase):
         instrumentor.instrument()
         instrumentor.uninstrument()
 
+
+class DependencyCheckTests(TestCase):
+    """
+    Pins the any-of dependency check that supports the juice fork.
+
+    `BaseInstrumentor`'s default `_check_dependency_conflicts` only accepts an
+    all-of list. The two distributions `django-q2` (upstream) and
+    `django-q2-full-of-juice` (fork) ship the same `django_q` import package
+    under different names — only one is ever installed. Without an any-of
+    override, installing the fork would make `instrument()` silently no-op
+    (DependencyConflict short-circuits before `_instrument()` runs).
+    """
+
+    def test_dep_check_passes_with_upstream_django_q2_installed(self):
+        # testapp's container has upstream `django-q2 1.10.0`. The any-of
+        # check must accept this and return no conflict.
+        instrumentor = DjangoQ2Instrumentor()
+        self.assertIsNone(instrumentor._check_dependency_conflicts())
+
+    def test_dep_check_passes_when_only_fork_is_installed(self):
+        # Simulate the fork-only install: upstream `django-q2` distribution is
+        # gone, `django-q2-full-of-juice` matches the version spec. Mocking the
+        # metadata reader is the safest way to avoid touching the live env.
+        from opentelemetry.util._importlib_metadata import PackageNotFoundError
+
+        def fake_version(name: str) -> str:
+            if name == "django-q2":
+                raise PackageNotFoundError(name)
+            if name == "django-q2-full-of-juice":
+                return "0.1.0"
+            raise PackageNotFoundError(name)
+
+        with mock.patch(
+            "opentelemetry.instrumentation.dependencies.version",
+            side_effect=fake_version,
+        ):
+            instrumentor = DjangoQ2Instrumentor()
+            self.assertIsNone(instrumentor._check_dependency_conflicts())
+
+    def test_dep_check_reports_conflict_when_neither_distribution_is_installed(self):
+        # Pure smoke: no django-q2 at all surfaces a conflict (auto-instrumentation
+        # will then refuse to call _instrument). Reused contract: the conflict's
+        # required_any must list BOTH options so an operator can see the choice.
+        from opentelemetry.util._importlib_metadata import PackageNotFoundError
+
+        def fake_version(name: str) -> str:
+            raise PackageNotFoundError(name)
+
+        with mock.patch(
+            "opentelemetry.instrumentation.dependencies.version",
+            side_effect=fake_version,
+        ):
+            instrumentor = DjangoQ2Instrumentor()
+            conflict = instrumentor._check_dependency_conflicts()
+            self.assertIsNotNone(conflict)
+            # Both distributions should appear in `required_any` so the user
+            # knows either upstream or the fork would resolve the conflict.
+            self.assertIn("django-q2 >= 1.10.0", list(conflict.required_any))
+            self.assertIn("django-q2-full-of-juice >= 0.1.0", list(conflict.required_any))
+
     def test_instrument_caches_resolved_broker_type(self):
         # _broker_type is computed once at _instrument() time so every span pays
         # zero Conf-read cost. Verify the cache lands and clears on uninstrument.

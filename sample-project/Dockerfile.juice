@@ -1,0 +1,35 @@
+# Build context MUST be the repo root so we can install the library from source.
+# Sister of ./Dockerfile — only difference is swapping upstream `django-q2` for
+# the `django-q2-full-of-juice` PyPI fork so the chain-progress signals are
+# present. See sample-project/docker-compose.yml's `juice-*` services.
+FROM python:3.14-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /lib
+
+RUN pip install --upgrade pip && \
+    pip install poetry==2.4.1 && \
+    poetry config virtualenvs.create false --local
+
+COPY pyproject.toml poetry.lock LICENSE README.md ./
+COPY opentelemetry_instrumentation_django_q2 ./opentelemetry_instrumentation_django_q2
+
+# Install the library's runtime deps the normal way — this pulls upstream
+# `django-q2` via the `~=1.10` constraint. We then swap that out for the fork
+# (same `django_q` import package, different distribution name) so the
+# pre_chain_progress / post_chain_progress signals exist at runtime. The library
+# itself is installed `--no-deps` afterwards so pip won't re-pull upstream.
+RUN poetry install --no-root --only main && \
+    pip uninstall --yes django-q2 && \
+    pip install "django-q2-full-of-juice==0.1.0" && \
+    pip install --no-deps -e .
+
+RUN pip install "opentelemetry-exporter-otlp-proto-grpc~=1.30"
+
+WORKDIR /app
+COPY sample-project ./
+
+RUN chmod +x ./scripts/*.sh
