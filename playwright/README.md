@@ -28,7 +28,7 @@ cd ../playwright
 npm install
 npm run install-browsers
 
-# 3. Run the tests
+# 3. Run the upstream-stack tests
 npm test
 ```
 
@@ -39,6 +39,36 @@ cd ../sample-project
 docker compose down --volumes
 ```
 
+### Juice-fork variant
+
+The instrumentor opportunistically connects to the two extra signals
+`django-q2-full-of-juice` adds (`pre_chain_progress` / `post_chain_progress`).
+A dedicated Playwright project — `juice` — exercises the cross-link chain
+continuity that those signals enable, against a separate sample stack built
+on the fork.
+
+```bash
+# 1. Bring up upstream + juice stacks together (Jaeger + collector are shared)
+cd ../sample-project
+docker compose --profile juice up --build -d
+
+# 2. Run only the juice specs
+cd ../playwright
+JUICE_SAMPLE_PROJECT_URL=http://localhost:8001 npm run test:juice
+
+# Or both projects in one run (upstream + juice):
+SAMPLE_PROJECT_URL=http://localhost:8000 \
+JUICE_SAMPLE_PROJECT_URL=http://localhost:8001 \
+  npm run test:all
+```
+
+`docker compose --profile juice up` brings up the existing `web` / `worker`
+plus a `juice-web` (port 8001) and `juice-worker` built from
+`sample-project/Dockerfile.juice`, both writing into the same Jaeger under
+service names `juice-web` / `juice-worker`. Without the `--profile juice` flag
+only the upstream services come up — keeping `docker compose up` zero-cost
+for contributors who only run the default suite.
+
 ## Layout
 
 ```
@@ -47,18 +77,20 @@ playwright/
 │   ├── data.ts        # unique(prefix) — per-test correlation id used as trigger_span
 │   ├── jaeger.ts      # Jaeger query API client + tree helpers + enqueue/enqueueChain/enqueueIter
 │   └── prometheus.ts  # OTel collector scrape helpers (parser + polling fetch)
-├── tests/
+├── tests/                              # `chromium` project — runs against the upstream `django-q2` stack
 │   ├── producer-consumer.spec.ts   # single task: HTTP → PRODUCER → CONSUMER, group, worker identifier
 │   ├── cascading.spec.ts           # linear cascade, fan-out, mid-cascade failure isolation, non-HTTP root
 │   ├── durations.spec.ts           # real broker-publish + consumer-side wall time
 │   ├── error-handling.spec.ts      # failing task → consumer span ERROR status + exception event
 │   ├── attributes.spec.ts          # django_q2.* attribute pack (hook, ack_failure, cached, task.name, ...)
 │   ├── state.spec.ts               # django_q2.state on consumer (success / error / cascade)
-│   ├── chain.spec.ts               # async_chain → decreasing django_q2.chain_length per layer
+│   ├── chain.spec.ts               # async_chain → decreasing django_q2.chain_length per layer (upstream caveat: links 2..N land in fresh traces)
 │   ├── iter.spec.ts                # async_iter → django_q2.iter_count on the umbrella task
 │   ├── baggage.spec.ts             # OTel baggage at HTTP edge survives the carrier round-trip
 │   └── metrics.spec.ts             # django_q2.task.duration + django_q2.publish.duration histograms
-├── playwright.config.ts            # baseURL = $SAMPLE_PROJECT_URL or localhost:8000
+├── tests-juice/                        # `juice` project — runs against the `django-q2-full-of-juice` stack
+│   └── chain-continuity.spec.ts    # async_chain cross-link continuity on one trace (juice-fork-only feature)
+├── playwright.config.ts            # baseURL: $SAMPLE_PROJECT_URL (chromium) / $JUICE_SAMPLE_PROJECT_URL (juice)
 ├── tsconfig.json
 └── package.json
 ```
@@ -100,12 +132,13 @@ it. Within a run, test order does not matter: tests find their trace by `trace_i
 
 ## Environment
 
-| Env var                    | Default                  | Meaning                                  |
-|----------------------------|--------------------------|------------------------------------------|
-| `SAMPLE_PROJECT_URL`       | `http://localhost:8000`  | Where the sample's web service is reachable. |
-| `JAEGER_URL`               | `http://localhost:16686` | Where Jaeger's UI + Query API is reachable. |
-| `COLLECTOR_PROMETHEUS_URL` | `http://localhost:8889`  | Where the OTel collector exposes Prometheus-format metrics (used by `metrics.spec.ts`). |
-| `CI`                       | unset                    | Switches reporters to `html` + `github`, enables retries, forbids `test.only`. |
+| Env var                     | Default                  | Meaning                                  |
+|-----------------------------|--------------------------|------------------------------------------|
+| `SAMPLE_PROJECT_URL`        | `http://localhost:8000`  | Where the upstream sample's web service is reachable (used by the `chromium` project). |
+| `JUICE_SAMPLE_PROJECT_URL`  | `http://localhost:8001`  | Where the juice-fork sample's web service is reachable (used by the `juice` project). |
+| `JAEGER_URL`                | `http://localhost:16686` | Where Jaeger's UI + Query API is reachable. Shared by both stacks. |
+| `COLLECTOR_PROMETHEUS_URL`  | `http://localhost:8889`  | Where the OTel collector exposes Prometheus-format metrics (used by `metrics.spec.ts`). |
+| `CI`                        | unset                    | Switches reporters to `html` + `github`, enables retries, forbids `test.only`. |
 
 ## CI
 

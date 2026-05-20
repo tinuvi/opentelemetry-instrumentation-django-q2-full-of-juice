@@ -230,7 +230,17 @@ export function indexTrace(trace: JaegerTrace) {
 
 export async function enqueueTask(
   request: APIRequestContext,
-  body: { task: string; trigger_span: string; args?: unknown[]; kwargs?: Record<string, unknown> },
+  body: {
+    task: string;
+    trigger_span: string;
+    args?: unknown[];
+    kwargs?: Record<string, unknown>;
+    // `q_options` forwards django-q2 control kwargs (`ack_failure`, `group`,
+    // `cluster`, ...) — kept distinct from `kwargs` so they can't collide with
+    // the task function's signature. Used by the juice retry spec to enable
+    // `ack_failure=True`.
+    q_options?: Record<string, unknown>;
+  },
 ): Promise<{ task_id: string; task: string; trace_id: string }> {
   const res = await request.post('/api/enqueue/', { data: body });
   expect(res.ok(), `enqueue failed: ${res.status()} ${await res.text()}`).toBeTruthy();

@@ -5,20 +5,33 @@ A minimal Django application that uses `django-q2` and the
 driven by the Playwright E2E suite under `../playwright/` — never published, never
 shipped.
 
+Two variants share this project:
+
+- The **default** stack (`web` + `worker`) builds from `Dockerfile` and runs
+  the library against upstream `django-q2`. This is what `docker compose up`
+  brings up by itself.
+- The **juice** stack (`juice-web` + `juice-worker`, behind the `juice` Docker
+  Compose profile) builds from `Dockerfile.juice` and swaps upstream
+  `django-q2` for the `django-q2-full-of-juice` PyPI fork — which adds the
+  `pre_chain_progress` / `post_chain_progress` signals the instrumentor relies
+  on for cross-link `async_chain` continuity. Activate it with
+  `docker compose --profile juice up`.
+
 ## Layout
 
 ```
 sample-project/
-├── Dockerfile          # Builds an image with the library installed editable from ../
-├── docker-compose.yml  # jaeger + web (runserver) + worker (qcluster), shared sqlite via volume
+├── Dockerfile          # Upstream image — library + `django-q2` from PyPI
+├── Dockerfile.juice    # Juice-fork image — same library, `django-q2-full-of-juice` from PyPI
+├── docker-compose.yml  # jaeger + collector + web + worker (default); + juice-web + juice-worker behind the `juice` profile
 ├── manage.py
 ├── sample/             # Django project (settings, urls, wsgi, asgi)
 ├── tasks_app/          # Django app: tasks, views, OTel bootstrap
 └── scripts/            # start-web.sh, start-worker.sh
 ```
 
-The build context for the Dockerfile is the **repo root** (one level up) so the sample
-can install the library from source. See `docker-compose.yml`.
+The build context for both Dockerfiles is the **repo root** (one level up) so the
+sample can install the library from source. See `docker-compose.yml`.
 
 ## Stack
 
@@ -35,8 +48,16 @@ can install the library from source. See `docker-compose.yml`.
 From the `sample-project/` directory:
 
 ```bash
+# Default — upstream `django-q2` stack only
 docker compose up --build
+
+# Default + juice-fork stack (sharing the same Jaeger + collector)
+docker compose --profile juice up --build
 ```
+
+The juice stack listens on `:8001` (vs `:8000` for upstream), writes to Jaeger
+under service names `juice-web` / `juice-worker`, and keeps its own sqlite
+volume so the two ORM brokers don't collide.
 
 Then in another terminal:
 

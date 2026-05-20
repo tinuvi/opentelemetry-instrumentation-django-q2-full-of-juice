@@ -54,7 +54,11 @@ Q_CLUSTER = {
     "name": os.environ.get("Q_CLUSTER_NAME", "sample-cluster"),
     "workers": int(os.environ.get("Q_CLUSTER_WORKERS", "2")),
     "timeout": 60,
-    "retry": 90,
+    # `retry` and `max_attempts` are env-overridable so the juice fork's E2E can
+    # force a fast re-delivery without affecting the upstream sample stack. The
+    # defaults match django-q2's own (retry=90s, max_attempts=0 ⇒ unlimited).
+    "retry": int(os.environ.get("Q_CLUSTER_RETRY", "90")),
+    "max_attempts": int(os.environ.get("Q_CLUSTER_MAX_ATTEMPTS", "0")),
     "orm": "default",
     "sync": False,
     "catch_up": False,
