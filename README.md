@@ -29,6 +29,63 @@ DjangoQ2Instrumentor().instrument()
 
 Call this once before workers fork (e.g. in your project's `AppConfig.ready()`, or via the `opentelemetry-instrument` CLI bootstrap).
 
+## Capabilities
+
+A scan-map of what the instrumentor emits and how you turn each piece on. Legend: ✅ supported · ⚙️ automatic, zero config · ⚠️ supported, with a caveat · `—` no dedicated end-to-end spec yet (still covered by the Python suite).
+
+| Capability | Status | How you get it | E2E proof |
+|---|:---:|---|---|
+| Producer (`PUBLISH`) span bracketing `async_task` — real broker-publish latency | ✅ | call `instrument()` before workers fork | `producer-consumer`, `durations` |
+| Consumer (`PROCESS`) span around task execution | ⚙️ | automatic | `producer-consumer` |
+| Trace-context propagation producer → worker (carrier rides the signed payload) | ⚙️ | automatic | `producer-consumer` |
+| **Baggage** propagation across the queue boundary | ⚙️ | automatic (composite propagator) | `baggage` |
+| **Cascading** tasks — a nested `async_task` parents under the consumer span | ✅ | automatic | `cascading` |
+| **Chain** (`async_chain`) continuity — every link lands on one trace&nbsp;† | ✅ | automatic | `chain-continuity` |
+| **Scheduled / cron** tasks (`schedule`) | ⚠️ instrumented, but each run roots a fresh trace (the scheduler has no inbound parent) | automatic | `—` |
+| **Sync mode** (`sync=True`) | ✅ | automatic | `—` |
+| Error status + `exception` events — including cause-chains (`raise B from A` → two events) and `add_note()`&nbsp;† | ✅ | automatic | `error-handling`, `exception-passthrough` |
+| **Retry / attempt** tracking (`django_q2.attempt`)&nbsp;† | ✅ | automatic | `retry` |
+| Producer **and** consumer duration histograms, bounded cardinality | ✅ | `meter_provider=` or the global meter | `metrics`, `durations` |
+| Messaging semconv + `broker.type` + `timeout` + worker / `client.id` attributes | ✅ | automatic | `attributes`, `iter` |
+| Bring-your-own providers (`tracer_provider=` / `meter_provider=`) | ✅ | pass them to `instrument()` | `—` |
+| Zero-code activation via the `opentelemetry-instrument` CLI | ⚙️ | run your process under the CLI (the entry point is registered) | `—` |
+| `uninstrument()` — full, idempotent teardown | ✅ | `DjangoQ2Instrumentor().uninstrument()` | `—` |
+
+&nbsp;† Available with the [`django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) runtime — the pairing this package is built for. On a stock `django-q2` install these degrade gracefully rather than break; see [Caveats](#caveats).
+
+End-to-end specs live under `playwright/tests/` and `playwright/tests-juice/`; the names above are the spec files (minus the `.spec.ts` suffix).
+
+## Setup options
+
+Pick whichever fits your bootstrap — the instrumentor behaves identically either way.
+
+**Programmatic (default).** Call `instrument()` once before any worker forks; `AppConfig.ready()` is the canonical spot:
+
+```python
+from opentelemetry_instrumentation_django_q2 import DjangoQ2Instrumentor
+
+DjangoQ2Instrumentor().instrument()
+```
+
+**Bring your own providers.** Skip the global lookup and hand the instrumentor explicit providers — handy when you build the SDK yourself (e.g. per worker after `os.fork`):
+
+```python
+DjangoQ2Instrumentor().instrument(
+    tracer_provider=my_tracer_provider,
+    meter_provider=my_meter_provider,
+)
+```
+
+**Zero code via the CLI.** The package registers an `opentelemetry_instrumentor` entry point, so the bootstrap CLI activates it with no call site of your own:
+
+```bash
+opentelemetry-instrument python manage.py qcluster
+```
+
+This is also the simplest fork-safe story: each worker initializes its own SDK on import, so the `BatchSpanProcessor` background threads live in the process that actually exports (see [Caveats](#caveats)).
+
+**Teardown.** `DjangoQ2Instrumentor().uninstrument()` unwinds everything — the `async_task` wrap, every signal connection, and any per-task context — and is idempotent, so it's safe to call from a test `tearDown`.
+
 ## How it works
 
 The instrumentor connects to django-q2's signal lifecycle. The PRODUCER span is opened by a `wrapt` wrapper around `django_q.tasks.async_task` (so it brackets the broker call); signals enrich it and bridge to the consumer side.
@@ -47,6 +104,17 @@ Because the consumer span is the current OTel context **during** task execution,
 The chain-progress hooks above are only fired by the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork, which adds two `Signal()` instances on top of upstream and wraps `async_chain(...)` with them inside `django_q.monitor`. The instrumentor connects opportunistically: when the fork is installed it lights up; on upstream `django-q2` the import fails silently and chain links 2..N keep starting fresh traces (the existing caveat).
 
 The carrier travels inside the pickled, signed payload (not in broker headers), so it's confidentiality-bound to producers/workers that share `Q_CLUSTER`'s `SECRET_KEY`. Fine for django-q2↔django-q2 propagation; not suitable for non-django-q2 observers reading the broker directly.
+
+## Baggage propagation
+
+The carrier the instrumentor injects is the full W3C context, so OpenTelemetry **Baggage** rides across the queue alongside the trace — there's no separate switch to flip. Whatever you set at the HTTP edge (the usual `user.id` / `tenant.id` / `request.id` correlation keys) is in scope on the producer span, the consumer span, and every cascaded producer/consumer below it, without any layer restamping it by hand.
+
+It works because the instrumentor uses OpenTelemetry's default composite propagator (`tracecontext,baggage`) to write the carrier and re-attach it before the task runs. Swap in a TraceContext-only propagator and baggage stops flowing — the `baggage` E2E spec pins exactly that contract so a future carrier refactor can't silently drop it.
+
+Two cautions:
+
+- **No PII in Baggage.** The values travel inside the signed task payload, and — if you also run the HTTP/`requests` instrumentations — Baggage propagates on outbound calls to third parties too. Keep it to non-sensitive, non-joinable correlation keys.
+- Baggage is bound to the same `SECRET_KEY` confidentiality boundary as the rest of the carrier (described just above).
 
 ## Span attributes
 
@@ -87,6 +155,12 @@ Consumer spans inherit `Status(ERROR)` with the underlying error message when `t
 Plumb a meter provider with `DjangoQ2Instrumentor().instrument(meter_provider=...)`, or rely on the global one set by `opentelemetry.metrics.set_meter_provider(...)`. Cardinality is bounded intentionally: task name and task id are deliberately **not** labels — they would explode any non-trivial workload. Operators can split a slow broker (`publish.duration` rising, `task.duration` flat) from slow workers (the inverse) without leaving the same dashboard.
 
 `django_q2.broker.type` is also deliberately **not** a metric label. django-q2 has a single broker per cluster, so most fleets would carry a constant value on every histogram series — pure noise with no analytical payoff. Adding a label later is a backward-compatible change; removing one is breaking. The attribute is still emitted on every PRODUCER and CONSUMER span, so operators running multiple cluster types can split traces by backend via span queries.
+
+## Scheduled & cron tasks
+
+`schedule(...)` (one-off `ONCE`, minutely/hourly/daily, `CRON`, …) is dispatched by django-q2's scheduler, which calls `async_task` for each due run (`django_q/scheduler.py`). So scheduled and cron tasks are instrumented exactly like a direct call — producer span, consumer span, the full attribute pack, and both duration histograms all apply.
+
+The one difference is trace shape. The scheduler runs in the cluster process, which has no inbound request context, so **each scheduled run roots its own fresh trace** rather than hanging off an HTTP request. `django_q2.group` and `django_q2.chain_length` are still stamped, so a scheduled task that fans out into a chain stays pivotable by group.
 
 ## Caveats
 
