@@ -17,7 +17,7 @@ authors = [
 # [tool.poetry.dependencies]: the moment ANY [project.optional-dependencies]
 # table exists, poetry-core turns off its legacy mode and only [project]-table
 # entries reach the wheel's Requires-Dist — main deps left solely in
-# [tool.poetry.dependencies] would be silently dropped. scripts/check_wheel_metadata.py
+# [tool.poetry.dependencies] would be silently dropped. .github/workflows/check_wheel_metadata.py
 # guards this in CI. See issue #3.
 dependencies = [
     "django>=5.2.11,<6.0",
@@ -109,6 +109,7 @@ project-excludes = [
     "**/__pycache__",
     "**/*venv/**",
     ".github/workflows/test_pypi_publish.py",
+    ".github/workflows/check_wheel_metadata.py",
 ]
 check-unannotated-defs = false
 infer-return-types = "checked"

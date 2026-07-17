@@ -33,6 +33,6 @@ jobs:
           poetry build
           # Last line of defense: fail the publish if the wheel's Requires-Dist ever
           # regresses the issue #3 packaging contract before it reaches PyPI.
-          python scripts/check_wheel_metadata.py dist/*.whl
+          python .github/workflows/check_wheel_metadata.py dist/*.whl
           poetry config pypi-token.pypi ${{ secrets.PYPI_TOKEN }}
           poetry publish

@@ -2,7 +2,7 @@
 """Assert a built wheel's Requires-Dist matches the issue #3 packaging contract.
 
 Usage:
-    python scripts/check_wheel_metadata.py dist/*.whl
+    python .github/workflows/check_wheel_metadata.py dist/*.whl
 
 The glob is expanded by the shell into a single wheel path (poetry build emits
 exactly one wheel). This is the regression guard for the poetry-core legacy-mode
@@ -113,7 +113,7 @@ def check(wheel_path):
 
 def main():
     if len(sys.argv) != 2:
-        raise SystemExit("Usage: python scripts/check_wheel_metadata.py <wheel-path>")
+        raise SystemExit("Usage: python .github/workflows/check_wheel_metadata.py <wheel-path>")
 
     wheel_path = sys.argv[1]
     requires_dist, errors = check(wheel_path)

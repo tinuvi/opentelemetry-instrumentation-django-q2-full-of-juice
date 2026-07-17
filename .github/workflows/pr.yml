@@ -42,7 +42,7 @@ jobs:
       - name: Build wheel and check metadata
         run: |
           poetry build
-          python scripts/check_wheel_metadata.py dist/*.whl
+          python .github/workflows/check_wheel_metadata.py dist/*.whl
       - name: Configure Test PyPI
         if: github.event.pull_request.head.repo.full_name == github.repository
         run: |
