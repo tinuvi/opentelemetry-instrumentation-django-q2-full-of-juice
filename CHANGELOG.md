@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-07-17
+
+### Changed
+- Removed the hard runtime dependency on `django-q2`. The instrumented library is now declared only via the `instruments-any` extra (the upstream OpenTelemetry contrib convention — `opentelemetry.instrumentation.dependencies` reads the `extra == "instruments-any"` markers), so `django-q2` no longer ships in the wheel's `Requires-Dist`. Consumers must install exactly one `django_q` provider themselves — either upstream `django-q2` or the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork — because both ship the same `django_q` import package under different PyPI names and installing both silently clobbers `site-packages`. Releases up to and including `0.2.0` keep the old hard dependency in their published metadata (PyPI artifacts are immutable); upgrade to receive the fix. Fixes [#3](https://github.com/tinuvi/opentelemetry-instrumentation-django-q2-full-of-juice/issues/3).
+
 ## [0.2.0] - 2026-05-20
 
 ### Added

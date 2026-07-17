@@ -36,6 +36,13 @@ jobs:
           python-version: "3.14"
       - name: Install Poetry
         run: pip install poetry==2.4.1
+      # Build the wheel and assert its Requires-Dist matches the issue #3 packaging
+      # contract (no runtime django-q2, providers only via the instruments-any extra).
+      # No `if:` guard and no secrets, so it also runs on PRs from forks.
+      - name: Build wheel and check metadata
+        run: |
+          poetry build
+          python .github/workflows/check_wheel_metadata.py dist/*.whl
       - name: Configure Test PyPI
         if: github.event.pull_request.head.repo.full_name == github.repository
         run: |

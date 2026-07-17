@@ -16,7 +16,13 @@ RUN pip install --upgrade pip && \
 COPY pyproject.toml poetry.lock LICENSE README.md ./
 COPY opentelemetry_instrumentation_django_q2 ./opentelemetry_instrumentation_django_q2
 
-RUN poetry install --no-root --only main && pip install --no-deps -e .
+# The library no longer depends on any `django_q` provider at runtime (issue #3),
+# so `--only main` installs zero of them — the sample must pick one explicitly.
+# This upstream image chooses `django-q2`; the juice image (Dockerfile.juice)
+# chooses the fork instead.
+RUN poetry install --no-root --only main && \
+    pip install "django-q2~=1.10" && \
+    pip install --no-deps -e .
 
 # --- Sample-only runtime deps (OTLP gRPC exporter to Jaeger) ---
 # Kept out of the library's pyproject — it's the sample that needs to ship spans,

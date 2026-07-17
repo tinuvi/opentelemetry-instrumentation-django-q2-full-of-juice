@@ -7,17 +7,37 @@ Transparent OpenTelemetry instrumentation for [`django-q2`](https://github.com/d
 
 ## Installation
 
+This package does **not** pull in a `django_q` provider of its own. Install the
+instrumentation plus exactly **one** provider — either upstream `django-q2` or the
+`django-q2-full-of-juice` fork:
+
 ```bash
-pip install opentelemetry-instrumentation-django-q2-full-of-juice
+# Upstream django-q2
+pip install opentelemetry-instrumentation-django-q2-full-of-juice django-q2
+
+# …or the juice fork (adds chain-continuity / attempt / exc_info signals)
+pip install opentelemetry-instrumentation-django-q2-full-of-juice django-q2-full-of-juice
 ```
 
 Or, with Poetry:
 
 ```bash
-poetry add opentelemetry-instrumentation-django-q2-full-of-juice
+poetry add opentelemetry-instrumentation-django-q2-full-of-juice django-q2
 ```
 
-Requires Python ≥ 3.12, Django ≥ 5.2.11, and django-q2 ≥ 1.10.0.
+Both providers ship the **same** `django_q` import package under different PyPI
+distribution names, so only one may be installed at a time. Installing both silently
+clobbers files in `site-packages` (pip does not detect the conflict; last install wins)
+— that's why the instrumentation declares neither as a runtime dependency.
+
+> **⚠️ Do not run `pip install opentelemetry-instrumentation-django-q2-full-of-juice[instruments-any]`.**
+> The package exposes an `instruments-any` extra listing *both* providers, but the extra
+> exists as **machine-readable metadata** for OpenTelemetry tooling
+> (`opentelemetry.instrumentation.dependencies` reads the `extra == "instruments-any"`
+> markers to know which distributions satisfy this instrumentation) — installing it would
+> pull in *both* providers and recreate the clobbering. Pick one provider by name instead.
+
+Requires Python ≥ 3.12, Django ≥ 5.2.11, and django-q2 ≥ 1.10.0 (or django-q2-full-of-juice ≥ 0.1.0).
 
 ## Quick start
 

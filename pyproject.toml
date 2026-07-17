@@ -9,8 +9,37 @@ version = "0.0.0"
 description = "OpenTelemetry instrumentation for django-q2"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file = "LICENSE" }
+requires-python = ">=3.12"
 authors = [
     {name = "Tinuvi", email = "no-reply@tinuvi.com"}
+]
+# Static PEP 621 runtime dependencies. These MUST live here, not only in
+# [tool.poetry.dependencies]: the moment ANY [project.optional-dependencies]
+# table exists, poetry-core turns off its legacy mode and only [project]-table
+# entries reach the wheel's Requires-Dist — main deps left solely in
+# [tool.poetry.dependencies] would be silently dropped. .github/workflows/check_wheel_metadata.py
+# guards this in CI. See issue #3.
+dependencies = [
+    "django>=5.2.11,<6.0",
+    "opentelemetry-api>=1.41,<2.0",
+    "opentelemetry-instrumentation>=0.62b1,<1.0",
+    "opentelemetry-semantic-conventions>=0.62b1,<1.0",
+    "wrapt>=1.17,<2.0",
+]
+
+[project.optional-dependencies]
+# The instrumented library is declared ONLY here — never as an unconditional
+# runtime dependency. `django-q2-full-of-juice` is a fork of `django-q2` that
+# ships the SAME `django_q` import package under a different PyPI name, so
+# installing both silently clobbers site-packages (issue #3). Consumers install
+# exactly ONE. Do NOT `pip install ...[instruments-any]` — that pulls BOTH and
+# recreates the clobbering. The `instruments-any` name is the upstream
+# OpenTelemetry contrib convention for "any one of these satisfies the
+# instrumentation" and is parsed by
+# opentelemetry.instrumentation.dependencies.get_dist_dependency_conflicts.
+instruments-any = [
+    "django-q2>=1.10,<2.0",
+    "django-q2-full-of-juice>=0.1.0",
 ]
 
 [tool.poetry]
@@ -24,13 +53,11 @@ repository = "https://github.com/tinuvi/opentelemetry-instrumentation-django-q2-
 django_q2 = "opentelemetry_instrumentation_django_q2:DjangoQ2Instrumentor"
 
 [tool.poetry.dependencies]
-python = "^3.12"
-django = "^5.2.11"
-"django-q2" = "~=1.10"
-opentelemetry-api = ">=1.41,<2.0"
-opentelemetry-instrumentation = ">=0.62b1,<1.0"
-opentelemetry-semantic-conventions = ">=0.62b1,<1.0"
-wrapt = "^1.17"
+# Only the Python constraint stays in Poetry's table — it carries the locking
+# upper bound Poetry needs for resolution (PEP 621's requires-python has none).
+# Every runtime dependency now lives in [project] above so the wheel metadata is
+# fully static. See issue #3.
+python = ">=3.12,<4.0"
 
 [tool.poetry.group.dev.dependencies]
 coverage = "~=7.13"
@@ -41,6 +68,10 @@ django-stubs = "~=6.0"
 unittest-xml-reporting = "~=4.0"
 opentelemetry-sdk = ">=1.41,<2.0"
 opentelemetry-test-utils = ">=0.62b1,<1.0"
+# Supplies a `django_q` import provider for the integration-test environment.
+# The library no longer depends on any provider at runtime (issue #3), so the
+# dev group must pick one. Dev groups never reach the published wheel metadata.
+"django-q2" = "~=1.10"
 
 [tool.ruff]
 line-length = 120
@@ -78,6 +109,7 @@ project-excludes = [
     "**/__pycache__",
     "**/*venv/**",
     ".github/workflows/test_pypi_publish.py",
+    ".github/workflows/check_wheel_metadata.py",
 ]
 check-unannotated-defs = false
 infer-return-types = "checked"
