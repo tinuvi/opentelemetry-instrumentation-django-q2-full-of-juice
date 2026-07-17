@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-07-17
+
+### Changed
+- Removed the hard runtime dependency on `django-q2`. The instrumented library is now declared only via the `instruments-any` extra (the upstream OpenTelemetry contrib convention — `opentelemetry.instrumentation.dependencies` reads the `extra == "instruments-any"` markers), so `django-q2` no longer ships in the wheel's `Requires-Dist`. Consumers must install exactly one `django_q` provider themselves — either upstream `django-q2` or the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork — because both ship the same `django_q` import package under different PyPI names and installing both silently clobbers `site-packages`. Releases up to and including `0.2.0` keep the old hard dependency in their published metadata (PyPI artifacts are immutable); upgrade to receive the fix. Fixes [#3](https://github.com/tinuvi/opentelemetry-instrumentation-django-q2-full-of-juice/issues/3).
+
 ## [0.2.0] - 2026-05-20
 
 ### Added
@@ -12,7 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `django_q2.attempt` attribute on producer and consumer spans when the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork's pusher stamps `task["attempt"]` on dequeue — `1` on first delivery, `N >= 2` on re-deliveries (the broker re-pops tasks whose lock expired without an ack). Stamped on attempt 1 too so dashboards can filter `attempt > 1` without confusing "no retries" with "no instrumentation"; absent on upstream `django-q2 1.10.x` and in sync mode (pusher is bypassed). Deliberately not added to the histogram labels: most tasks succeed on attempt 1 so the column would be a constant on every series, and removing a metric label later is a breaking change for downstream dashboards.
 
 ### Changed
-- Removed the hard runtime dependency on `django-q2`. The instrumented library is now declared only via the `instruments-any` extra (the upstream OpenTelemetry contrib convention — `opentelemetry.instrumentation.dependencies` reads the `extra == "instruments-any"` markers), so `django-q2` no longer ships in the wheel's `Requires-Dist`. Consumers must install exactly one `django_q` provider themselves — either upstream `django-q2` or the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork — because both ship the same `django_q` import package under different PyPI names and installing both silently clobbers `site-packages`. Fixes [#3](https://github.com/tinuvi/opentelemetry-instrumentation-django-q2-full-of-juice/issues/3).
 - Failed-task `exception` events on the consumer span now prefer the live `sys.exc_info()` triple when the [`tinuvi/django-q2-full-of-juice`](https://github.com/tinuvi/django-q2-full-of-juice) fork forwards it as a kwarg on `post_execute_in_worker`. The instrumentor calls `span.record_exception(exc)` per link in the `__cause__` / `__context__` chain, so a `raise B from A` emits one event per cause (each addressable via `exception.type`) and Python 3.11+ `exc.add_note()` annotations surface in `exception.stacktrace`. `otel.status_description` is now `str(exc)` on the outermost exception. On upstream `django-q2` (no `exc_info` kwarg) and on malformed triples the existing single-event string-parse fallback (`parse_worker_result()`) runs unchanged, so the consumer span stays meaningful in both worlds. Dashboards keyed on the exact event count for failures may now see N events instead of 1 on the fork; queries filtering by `exception.type` still work.
 
 ## [0.1.0] - First release
